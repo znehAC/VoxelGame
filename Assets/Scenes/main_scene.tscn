@@ -1,0 +1,50 @@
+[gd_scene load_steps=7 format=3 uid="uid://8hu3gkr3x5u"]
+
+[ext_resource type="Script" uid="uid://dl88cx2frflyx" path="res://src/Voxel/World.cs" id="1_p3qsx"]
+[ext_resource type="Script" uid="uid://cgmt6hn8v2ucy" path="res://src/Control/DebugFlyCamera.cs" id="2_1moq4"]
+
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_p3qsx"]
+vertex_color_use_as_albedo = true
+
+[sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_p3qsx"]
+sky_top_color = Color(0.78215873, 0.90542465, 0.9630323, 1)
+sky_horizon_color = Color(0.71970564, 0.90077925, 0.9936219, 1)
+ground_bottom_color = Color(1, 1, 1, 1)
+sun_angle_max = 182.31
+
+[sub_resource type="Sky" id="Sky_1moq4"]
+sky_material = SubResource("ProceduralSkyMaterial_p3qsx")
+
+[sub_resource type="Environment" id="Environment_xcvj3"]
+background_mode = 2
+sky = SubResource("Sky_1moq4")
+ambient_light_source = 3
+
+[node name="World" type="Node3D" node_paths=PackedStringArray("PerformanceLabel")]
+script = ExtResource("1_p3qsx")
+VoxelMaterial = SubResource("StandardMaterial3D_p3qsx")
+PerformanceLabel = NodePath("UI/Performance")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+transform = Transform3D(-0.93105584, -0.36487684, -1.5949274e-08, 0, -4.3711392e-08, 1, -0.36487684, 0.93105584, 4.0697746e-08, 0, 159.63597, 0)
+shadow_enabled = true
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_xcvj3")
+
+[node name="MainCamera" type="Camera3D" parent="."]
+transform = Transform3D(0.98367214, 0, -0.17996979, 0, 1, 0, 0.17996979, 0, 0.98367214, 0.25489974, 35.39564, 140.82161)
+
+[node name="DebugCamera" type="Camera3D" parent="."]
+transform = Transform3D(-0.9917547, 0.051824167, 0.11720454, 0.017715156, 0.9612437, -0.27513066, -0.12692054, -0.2707858, -0.954236, 32.268734, 19.355125, -16.709747)
+current = true
+script = ExtResource("2_1moq4")
+
+[node name="UI" type="CanvasLayer" parent="."]
+
+[node name="Performance" type="Label" parent="UI"]
+z_index = 2
+offset_right = 160.0
+offset_bottom = 58.0
+theme_override_colors/font_color = Color(0, 0, 0, 1)
+theme_override_colors/font_outline_color = Color(1, 1, 1, 1)
