@@ -12,7 +12,7 @@ public struct MeshData
 public static class GreedyMesher
 {
 
-    public static MeshData GenerateMeshData(byte[] paddedVoxels, int size, Color[] palette)
+    public static MeshData GenerateMeshData(byte[] paddedVoxels, int size, VoxelDefinition[] definitions)
     {
         int paddedSize = size + 2;
         var vertices = new List<Vector3>();
@@ -48,8 +48,8 @@ public static class GreedyMesher
                         byte typeA = paddedVoxels[Idx(x[0] + 1, x[1] + 1, x[2] + 1)];
                         byte typeB = paddedVoxels[Idx(x[0] + q[0] + 1, x[1] + q[1] + 1, x[2] + q[2] + 1)];
 
-                        bool solidA = typeA != 0;
-                        bool solidB = typeB != 0;
+                        bool solidA = definitions[typeA].IsSolid;
+                        bool solidB = definitions[typeB].IsSolid;
 
                         if (solidA == solidB)
                         {
@@ -107,10 +107,10 @@ public static class GreedyMesher
                             Vector3 faceNormal = forwardFace ? normal : -normal;
                             normals.Add(faceNormal); normals.Add(faceNormal); normals.Add(faceNormal); normals.Add(faceNormal);
 
-                            Color col = palette[type];
+                            Color col = definitions[type].VoxelColor;
                             colors.Add(col); colors.Add(col); colors.Add(col); colors.Add(col);
 
-                            if (forwardFace) // Counter-Clockwise winding for Godot
+                            if (forwardFace) // Counter-Clockwise winding
                             {
                                 indices.Add(indexCount + 0);
                                 indices.Add(indexCount + 2);
@@ -130,7 +130,6 @@ public static class GreedyMesher
                             }
                             indexCount += 4;
 
-                            // Zero out the mask area we just covered
                             for (int l = 0; l < h; l++)
                                 for (int k = 0; k < w; k++)
                                     mask[n + k + l * size] = (0, false);

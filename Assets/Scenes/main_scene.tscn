@@ -32,14 +32,6 @@ shadow_enabled = true
 [node name="WorldEnvironment" type="WorldEnvironment" parent="."]
 environment = SubResource("Environment_xcvj3")
 
-[node name="MainCamera" type="Camera3D" parent="."]
-transform = Transform3D(0.98367214, 0, -0.17996979, 0, 1, 0, 0.17996979, 0, 0.98367214, 0.25489974, 35.39564, 140.82161)
-
-[node name="DebugCamera" type="Camera3D" parent="."]
-transform = Transform3D(-0.9917547, 0.051824167, 0.11720454, 0.017715156, 0.9612437, -0.27513066, -0.12692054, -0.2707858, -0.954236, 32.268734, 19.355125, -16.709747)
-current = true
-script = ExtResource("2_1moq4")
-
 [node name="UI" type="CanvasLayer" parent="."]
 
 [node name="Performance" type="Label" parent="UI"]
@@ -48,3 +40,14 @@ offset_right = 160.0
 offset_bottom = 58.0
 theme_override_colors/font_color = Color(0, 0, 0, 1)
 theme_override_colors/font_outline_color = Color(1, 1, 1, 1)
+
+[node name="Player" type="CharacterBody3D" parent="."]
+transform = Transform3D(-0.99254614, 0, 0.12186928, 0, 1, 0, -0.12186928, 0, -0.99254614, 32, 19.3, -16.71)
+motion_mode = 1
+
+[node name="DebugCamera" type="Camera3D" parent="Player"]
+transform = Transform3D(-0.9917547, 0.051824167, 0.11720454, 0.017715156, 0.9612437, -0.27513066, -0.12692054, -0.2707858, -0.954236, 32.268734, 19.355125, -16.709747)
+current = true
+script = ExtResource("2_1moq4")
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="Player"]
