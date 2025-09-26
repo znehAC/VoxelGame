@@ -37,17 +37,17 @@ public partial class World : Node3D
         foreach (var chunk in VoxelChunks.Values)
         {
             chunk.InitializeMesh(this, VoxelMaterial);
-            chunk.RebuildMesh();
+            // chunk.RebuildMesh();
         }
     }
 
     public override void _Process(double delta)
     {
 
-        // foreach (var chunk in VoxelChunks.Values)
-        // {
-        //     chunk.RebuildMesh();
-        // }
+        foreach (var chunk in VoxelChunks.Values)
+        {
+            chunk.RebuildMesh();
+        }
 
         if (PerformanceLabel != null)
         {
