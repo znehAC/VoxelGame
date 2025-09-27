@@ -2,17 +2,31 @@ using Godot;
 using System.Collections.Concurrent;
 using System.Threading.Tasks;
 
+public enum VoxelJobType { GenerateData, GenerateMesh }
+
+public readonly struct VoxelJob
+{
+    public readonly Vector3I Position;
+    public readonly VoxelJobType JobType;
+
+    public VoxelJob(Vector3I position, VoxelJobType jobType)
+    {
+        Position = position;
+        JobType = jobType;
+    }
+}
+
 public class VoxelMesherPool
 {
     public int WorkerCount { get; private set; }
     public int WorkQueueCount => _workQueue.Count;
 
     private readonly World _world;
-    private readonly ConcurrentQueue<Vector3I> _workQueue = new();
-    private readonly ConcurrentQueue<(Vector3I, MeshData)> _resultsQueue = new();
-
     private readonly FastNoiseLite _terrainNoise;
     private readonly FastNoiseLite _caveNoise;
+
+    private readonly ConcurrentQueue<VoxelJob> _workQueue = new();
+    private readonly ConcurrentQueue<(VoxelJob job, object data)> _resultsQueue = new();
 
     public VoxelMesherPool(World world, FastNoiseLite terrainNoise, FastNoiseLite caveNoise)
     {
@@ -23,8 +37,7 @@ public class VoxelMesherPool
 
     public void Start()
     {
-        WorkerCount = System.Math.Max(1, System.Environment.ProcessorCount);
-
+        WorkerCount = System.Math.Max(1, System.Environment.ProcessorCount / 2);
         GD.Print($"Starting {WorkerCount} meshing workers.");
 
         for (int i = 0; i < WorkerCount; i++)
@@ -33,12 +46,12 @@ public class VoxelMesherPool
         }
     }
 
-    public void EnqueueJob(Vector3I chunkPosition)
+    public void EnqueueJob(VoxelJob job)
     {
-        _workQueue.Enqueue(chunkPosition);
+        _workQueue.Enqueue(job);
     }
 
-    public bool TryDequeueResult(out (Vector3I, MeshData) result)
+    public bool TryDequeueResult(out (VoxelJob job, object data) result)
     {
         return _resultsQueue.TryDequeue(out result);
     }
@@ -47,26 +60,35 @@ public class VoxelMesherPool
     {
         while (true)
         {
-            if (_workQueue.TryDequeue(out Vector3I chunkPosition))
+            if (_workQueue.TryDequeue(out VoxelJob job))
             {
                 try
                 {
-                    if (_world.VoxelChunks.TryGetValue(chunkPosition, out Chunk chunk))
+                    if (_world.VoxelChunks.TryGetValue(job.Position, out Chunk chunk))
                     {
-                        if (!chunk.IsDataGenerated)
+                        object resultData = null; // Can hold MeshData or be null
+
+                        switch (job.JobType)
                         {
-                            chunk.PrepareData(_terrainNoise, _caveNoise);
+                            case VoxelJobType.GenerateData:
+                                if (!chunk.IsDataGenerated)
+                                {
+                                    chunk.PrepareData(_terrainNoise, _caveNoise);
+                                }
+                                break;
+
+                            case VoxelJobType.GenerateMesh:
+                                resultData = chunk.GenerateMesh();
+                                break;
                         }
 
-                        MeshData meshData = chunk.GenerateMesh();
-                        _resultsQueue.Enqueue((chunkPosition, meshData));
+                        _resultsQueue.Enqueue((job, resultData));
                     }
                 }
                 catch (System.Exception e)
                 {
-                    GD.PrintErr($"Worker thread crashed on chunk {chunkPosition}: {e.Message}\n{e.StackTrace}");
+                    GD.PrintErr($"Worker thread crashed on chunk {job.Position}: {e.Message}\n{e.StackTrace}");
                 }
-                System.Threading.Thread.Sleep(100);
             }
             else
             {

@@ -6,7 +6,7 @@ public partial class Chunk : GodotObject
     private const int PaddedSize = Size + 2;
     public Vector3I Position { get; private set; }
 
-    private bool _isDataGenerated = false;
+    private volatile bool _isDataGenerated = false;
     public bool IsDataGenerated => _isDataGenerated;
 
     private readonly World _world;
