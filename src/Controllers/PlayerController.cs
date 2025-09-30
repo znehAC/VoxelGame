@@ -5,20 +5,21 @@ public partial class PlayerController : CharacterBody3D
     [Export]
     public float MouseSensitivity { get; set; } = 0.5f;
     [Export]
-    public float MoveSpeed { get; set; } = 200.0f; // Adjusted for 10cm voxels
+    public float MoveSpeed { get; set; } = 40.0f;
     [Export]
-    public float JumpVelocity { get; set; } = 15.0f;
+    public float JumpVelocity { get; set; } = 150.0f;
+    [Export]
+    public float FlySpeed { get; set; } = 100.0f;
 
-    // Gravity is based on Godot's project settings by default.
-    public float Gravity = ProjectSettings.GetSetting("physics/3d/default_gravity").AsSingle();
+    public float Gravity = ProjectSettings.GetSetting("physics/3d/default_gravity").AsSingle() * 30;
 
-    // We need a reference to the camera to rotate it for looking up/down.
     private Camera3D _camera;
     private Vector2 _mouseDelta;
+    private bool _isFlying = false;
 
     public override void _Ready()
     {
-        _camera = GetNode<Camera3D>("Camera3D"); // Get the child camera node
+        _camera = GetNode<Camera3D>("Camera3D");
         Input.MouseMode = Input.MouseModeEnum.Captured;
     }
 
@@ -37,46 +38,60 @@ public partial class PlayerController : CharacterBody3D
         {
             Input.MouseMode = Input.MouseModeEnum.Captured;
         }
+        if (e.IsActionPressed("toggle_fly"))
+        {
+            _isFlying = !_isFlying;
+            GD.Print($"Flying: {_isFlying}");
+        }
     }
 
     public override void _PhysicsProcess(double delta)
     {
         // --- Mouselook Rotation ---
-        // We handle this first. Note the separation of concerns.
-        if (Input.MouseMode == Input.MouseModeEnum.Captured)
-        {
-            // Rotate the entire CharacterBody3D for left/right (yaw)
-            RotateY(Mathf.DegToRad(-_mouseDelta.X * MouseSensitivity));
-
-            // Only rotate the Camera3D for up/down (pitch)
-            _camera.RotateX(Mathf.DegToRad(-_mouseDelta.Y * MouseSensitivity));
-
-            // Clamp the camera's rotation to prevent it from flipping upside down
-            var cameraRotation = _camera.RotationDegrees;
-            cameraRotation.X = Mathf.Clamp(cameraRotation.X, -90.0f, 90.0f);
-            _camera.RotationDegrees = cameraRotation;
-        }
+        HandleMouseLook();
         _mouseDelta = Vector2.Zero; // Reset delta each frame
 
         // --- Movement and Physics ---
         Vector3 velocity = Velocity;
+        Vector2 inputDir = Input.GetVector("move_left", "move_right", "move_forward", "move_backward");
+        Vector3 direction = (Transform.Basis * new Vector3(inputDir.X, 0, inputDir.Y)).Normalized();
 
-        // Apply gravity.
-        if (!IsOnFloor())
+        if (_isFlying)
         {
-            velocity.Y -= Gravity * (float)delta;
+            velocity = HandleFlying(direction, velocity);
+        }
+        else
+        {
+            velocity = HandleWalking(direction, velocity, (float)delta);
         }
 
-        // Handle Jump.
+        Velocity = velocity;
+        MoveAndSlide();
+    }
+
+    private void HandleMouseLook()
+    {
+        if (Input.MouseMode != Input.MouseModeEnum.Captured) return;
+
+        RotateY(Mathf.DegToRad(-_mouseDelta.X * MouseSensitivity));
+        _camera.RotateX(Mathf.DegToRad(-_mouseDelta.Y * MouseSensitivity));
+
+        var cameraRotation = _camera.RotationDegrees;
+        cameraRotation.X = Mathf.Clamp(cameraRotation.X, -90.0f, 90.0f);
+        _camera.RotationDegrees = cameraRotation;
+    }
+
+    private Vector3 HandleWalking(Vector3 direction, Vector3 velocity, float delta)
+    {
+        if (!IsOnFloor())
+        {
+            velocity.Y -= Gravity * delta;
+        }
+
         if (Input.IsActionJustPressed("jump") && IsOnFloor())
         {
             velocity.Y = JumpVelocity;
         }
-
-        // Get the input direction and handle the movement/deceleration.
-        Vector2 inputDir = Input.GetVector("move_left", "move_right", "move_forward", "move_backward");
-        // Use the CharacterBody's basis to move in the direction it's facing.
-        Vector3 direction = (Transform.Basis * new Vector3(inputDir.X, 0, inputDir.Y)).Normalized();
 
         if (direction != Vector3.Zero)
         {
@@ -85,14 +100,40 @@ public partial class PlayerController : CharacterBody3D
         }
         else
         {
-            // Simple friction/deceleration
             velocity.X = Mathf.MoveToward(Velocity.X, 0, MoveSpeed);
             velocity.Z = Mathf.MoveToward(Velocity.Z, 0, MoveSpeed);
         }
+        return velocity;
+    }
 
-        // This is the magic line. We set the Velocity property, and then...
-        Velocity = velocity;
-        // ...Godot's physics engine does the rest.
-        MoveAndSlide();
+    private Vector3 HandleFlying(Vector3 direction, Vector3 velocity)
+    {
+        // Horizontal movement
+        if (direction != Vector3.Zero)
+        {
+            velocity.X = direction.X * FlySpeed;
+            velocity.Z = direction.Z * FlySpeed;
+        }
+        else
+        {
+            velocity.X = Mathf.MoveToward(Velocity.X, 0, FlySpeed);
+            velocity.Z = Mathf.MoveToward(Velocity.Z, 0, FlySpeed);
+        }
+
+        // Vertical movement
+        if (Input.IsActionPressed("move_up"))
+        {
+            velocity.Y = FlySpeed;
+        }
+        else if (Input.IsActionPressed("move_down"))
+        {
+            velocity.Y = -FlySpeed;
+        }
+        else
+        {
+            velocity.Y = Mathf.MoveToward(Velocity.Y, 0, FlySpeed);
+        }
+
+        return velocity;
     }
 }

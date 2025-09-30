@@ -1,5 +1,6 @@
 using Godot;
 using System.Collections.Generic;
+using System.Threading;
 
 public struct MeshData
 {
@@ -12,7 +13,7 @@ public struct MeshData
 public static class GreedyMesher
 {
 
-    public static MeshData GenerateMeshData(byte[] paddedVoxels, int size, VoxelDefinition[] definitions)
+    public static MeshData GenerateMeshData(byte[] paddedVoxels, int size, VoxelDefinition[] definitions, CancellationToken token)
     {
         int paddedSize = size + 2;
         var vertices = new List<Vector3>();
@@ -39,6 +40,7 @@ public static class GreedyMesher
 
             for (x[axis] = -1; x[axis] < size; x[axis]++)
             {
+                // token.ThrowIfCancellationRequested();
                 // 1. --- Build the 2D mask for the current slice ---
                 int n = 0;
                 for (x[v] = 0; x[v] < size; x[v]++)

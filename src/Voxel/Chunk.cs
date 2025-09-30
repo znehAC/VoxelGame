@@ -1,5 +1,8 @@
 using Godot;
+using System.Threading;
 
+// datetime/performance import
+using System;
 public partial class Chunk : GodotObject
 {
     public const int Size = 32;
@@ -13,6 +16,8 @@ public partial class Chunk : GodotObject
     private readonly byte[] _voxels = new byte[Size * Size * Size];
 
     private MeshInstance3D _meshInstance;
+    private StaticBody3D _staticBody; // Add this
+    private CollisionShape3D _collisionShape; // Add this
 
     public Chunk(World world, Vector3I position)
     {
@@ -22,16 +27,29 @@ public partial class Chunk : GodotObject
 
     public void InitializeMesh(Node parent, Material material)
     {
+        Vector3 chunkWorldOrigin = (Vector3)Position * Size;
+
         _meshInstance = new MeshInstance3D();
-        _meshInstance.Transform = new Transform3D(Basis.Identity, Position * Size);
+        _meshInstance.Name = $"ChunkMesh_{Position}";
         _meshInstance.MaterialOverride = material;
-        parent.AddChild(_meshInstance);
+        _meshInstance.GlobalPosition = chunkWorldOrigin;
+
+        _staticBody = new StaticBody3D();
+        _staticBody.Name = $"ChunkStaticBody_{Position}";
+        _staticBody.GlobalPosition = chunkWorldOrigin;
+
+        _collisionShape = new CollisionShape3D();
+        _staticBody.AddChild(_collisionShape);
+
+        // Use CallDeferred to safely add nodes to the scene tree
+        parent.CallDeferred("add_child", _meshInstance);
+        parent.CallDeferred("add_child", _staticBody);
     }
 
-    public MeshData GenerateMesh()
+    public MeshData GenerateMesh(CancellationToken token)
     {
         byte[] paddedVoxels = BuildPaddedVoxels();
-        return GreedyMesher.GenerateMeshData(paddedVoxels, Size, VoxelTypes.Definitions);
+        return GreedyMesher.GenerateMeshData(paddedVoxels, Size, VoxelTypes.Definitions, token);
     }
 
     public void ApplyMeshData(MeshData meshData)
@@ -53,6 +71,30 @@ public partial class Chunk : GodotObject
         _meshInstance.Mesh = newMesh;
     }
 
+    public void ApplyCollisionData(MeshData meshData)
+    {
+        if (!GodotObject.IsInstanceValid(_collisionShape)) return;
+
+        // Create a new shape to clear any old data.
+        var shape = new ConcavePolygonShape3D();
+
+        // Only set faces if there's something to set.
+        if (meshData.Indices.Count > 0)
+        {
+            // This is the crucial fix. We build an array of vertices
+            // where every 3 vertices represent one triangle face,
+            // using the indices to get the correct order.
+            var faces = new Vector3[meshData.Indices.Count];
+            for (int i = 0; i < meshData.Indices.Count; i++)
+            {
+                faces[i] = meshData.Vertices[meshData.Indices[i]];
+            }
+            shape.SetFaces(faces);
+        }
+
+        _collisionShape.Shape = shape;
+    }
+
 
     private byte[] BuildPaddedVoxels()
     {
@@ -71,11 +113,19 @@ public partial class Chunk : GodotObject
         return paddedVoxels;
     }
 
+    public byte GetVoxelInternal(int x, int y, int z)
+    {
+        return _voxels[(z * Size * Size) + (y * Size) + x];
+    }
+
+    // Modify the existing GetVoxel method.
     public byte GetVoxel(int x, int y, int z)
     {
+        // lets check performance time here
+        var start = DateTime.Now;
         if (x >= 0 && x < Size && y >= 0 && y < Size && z >= 0 && z < Size)
         {
-            return _voxels[(z * Size * Size) + (y * Size) + x];
+            return GetVoxelInternal(x, y, z);
         }
 
         var worldPos = new Vector3I(Position.X * Size + x, Position.Y * Size + y, Position.Z * Size + z);
@@ -90,8 +140,11 @@ public partial class Chunk : GodotObject
                 (worldPos.X % Size + Size) % Size,
                 (worldPos.Y % Size + Size) % Size,
                 (worldPos.Z % Size + Size) % Size);
-            return neighborChunk.GetVoxel(localPos.X, localPos.Y, localPos.Z);
+
+            // This is the key: call the dumb getter on the neighbor.
+            return neighborChunk.GetVoxelInternal(localPos.X, localPos.Y, localPos.Z);
         }
+
         return VoxelTypes.Air;
     }
 
@@ -100,14 +153,14 @@ public partial class Chunk : GodotObject
         _voxels[(z * Size * Size) + (y * Size) + x] = value;
     }
 
-    public void PrepareData(FastNoiseLite terrainNoise, FastNoiseLite caveNoise)
+    public void PrepareData(FastNoiseLite terrainNoise, FastNoiseLite caveNoise, CancellationToken token)
     {
         if (_isDataGenerated) return;
         bool loadedFromFile = LoadChunkFromFile();
 
         if (!loadedFromFile)
         {
-            GenerateTerrainFromNoise(terrainNoise, caveNoise);
+            GenerateTerrainFromNoise(terrainNoise, caveNoise, token);
         }
 
         _isDataGenerated = true;
@@ -116,17 +169,17 @@ public partial class Chunk : GodotObject
 
     private bool LoadChunkFromFile()
     {
-
         return false;
     }
 
-    public void GenerateTerrainFromNoise(FastNoiseLite terrainNoise, FastNoiseLite caveNoise)
+    public void GenerateTerrainFromNoise(FastNoiseLite terrainNoise, FastNoiseLite caveNoise, CancellationToken token)
     {
         const float worldScale = 0.1f;
         for (int x = 0; x < Size; x++)
         {
             for (int z = 0; z < Size; z++)
             {
+                token.ThrowIfCancellationRequested();
                 int worldVoxelX = Position.X * Size + x;
                 int worldVoxelZ = Position.Z * Size + z;
                 float scaledX = worldVoxelX * worldScale;
@@ -181,5 +234,13 @@ public partial class Chunk : GodotObject
                 }
             }
         }
+    }
+
+    public void Unload()
+    {
+        if (GodotObject.IsInstanceValid(_meshInstance))
+            _meshInstance.QueueFree();
+        if (GodotObject.IsInstanceValid(_staticBody))
+            _staticBody.QueueFree();
     }
 }
