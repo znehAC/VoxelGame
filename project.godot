@@ -15,10 +15,6 @@ run/main_scene="uid://8hu3gkr3x5u"
 config/features=PackedStringArray("4.5", "C#", "Forward Plus")
 config/icon="res://icon.svg"
 
-[display]
-
-window/vsync/vsync_mode=0
-
 [dotnet]
 
 project/assembly_name="VoxelPowderSim"
@@ -30,7 +26,7 @@ version_control/autoload_on_startup=true
 
 [editor_plugins]
 
-enabled=PackedStringArray("res://addons/chunk_gizmo_plugin/plugin.cfg")
+enabled=PackedStringArray()
 
 [input]
 

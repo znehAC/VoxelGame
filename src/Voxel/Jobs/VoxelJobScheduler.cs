@@ -5,17 +5,39 @@ using System.Threading.Tasks;
 
 public enum VoxelJobType { GenerateData, GenerateMesh }
 
+public class MeshJobData
+{
+    public byte[] CenterVoxels { get; }
+    public byte[][] NeighborVoxels { get; }
+
+    public MeshJobData(Chunk centerChunk, Chunk[] neighbors)
+    {
+        CenterVoxels = centerChunk.GetVoxels();
+        NeighborVoxels = new byte[6][];
+        for (int i = 0; i < 6; i++)
+        {
+            if (neighbors[i] != null)
+            {
+                NeighborVoxels[i] = neighbors[i].GetVoxels();
+            }
+        }
+    }
+}
+
+
 public struct VoxelJob
 {
     public readonly Vector3I Position;
     public readonly VoxelJobType JobType;
     public CancellationToken Token;
+    public readonly object Payload;
 
-    public VoxelJob(Vector3I position, VoxelJobType jobType)
+    public VoxelJob(Vector3I position, VoxelJobType jobType, CancellationToken token, object payload = null)
     {
         Position = position;
         JobType = jobType;
-        Token = CancellationToken.None;
+        Token = token;
+        Payload = payload;
     }
 }
 
@@ -25,17 +47,23 @@ public class VoxelJobScheduler
     public int WorkQueueCount => _workQueue.Count;
 
     private readonly World _world;
-    private readonly FastNoiseLite _terrainNoise;
+    private readonly FastNoiseLite _continentalnessNoise;
+    private readonly FastNoiseLite _erosionNoise;
     private readonly FastNoiseLite _caveNoise;
 
     private readonly BlockingCollection<VoxelJob> _workQueue = new();
     private readonly ConcurrentQueue<(VoxelJob job, object data)> _resultsQueue = new();
 
-    public VoxelJobScheduler(World world, FastNoiseLite terrainNoise, FastNoiseLite caveNoise)
+
+    private readonly BaseMesher _mesher;
+
+    public VoxelJobScheduler(World world, FastNoiseLite continentalnessNoise, FastNoiseLite erosionNoise, FastNoiseLite caveNoise, BaseMesher mesher)
     {
         _world = world;
-        _terrainNoise = terrainNoise;
+        _continentalnessNoise = continentalnessNoise;
+        _erosionNoise = erosionNoise;
         _caveNoise = caveNoise;
+        _mesher = mesher;
     }
 
     public void Start()
@@ -62,6 +90,7 @@ public class VoxelJobScheduler
 
     private void WorkerLoop(int workerId)
     {
+        GD.Print($"[WORKER-{workerId}] Starting worker loop.");
         foreach (var job in _workQueue.GetConsumingEnumerable())
         {
             try
@@ -75,14 +104,18 @@ public class VoxelJobScheduler
                     switch (job.JobType)
                     {
                         case VoxelJobType.GenerateData:
-                            if (!chunk.IsDataGenerated)
-                            {
-                                chunk.PrepareData(_terrainNoise, _caveNoise, job.Token);
-                            }
+                            chunk.PrepareData(_continentalnessNoise, _erosionNoise, _caveNoise, job.Token);
                             break;
 
                         case VoxelJobType.GenerateMesh:
-                            resultData = chunk.GenerateMesh(job.Token);
+                            if (job.Payload is MeshJobData meshJobData)
+                            {
+                                resultData = _mesher.GenerateMeshData(meshJobData, VoxelTypes.Definitions, job.Token);
+                            }
+                            else
+                            {
+                                GD.PrintErr($"[WORKER-{workerId}] ERROR: GenerateMesh job for {job.Position} received invalid payload.");
+                            }
                             break;
                     }
 
@@ -97,13 +130,15 @@ public class VoxelJobScheduler
             }
             catch (System.OperationCanceledException)
             {
+                GD.Print($"[WORKER-{workerId}] Job for chunk {job.Position} was cancelled.");
             }
             catch (System.Exception e)
             {
                 GD.PrintErr($"[WORKER-{workerId}] ERROR on {job.Position}: {e.Message}");
-                GD.PrintErr($"[WORKER-{workerId}] Stack trace: {e.StackTrace}");
+                GD.PrintErr($"[WORK-ER-{workerId}] Stack trace: {e.StackTrace}");
             }
         }
+        GD.Print($"[WORKER-{workerId}] Exiting worker loop.");
     }
 
     public void Stop()

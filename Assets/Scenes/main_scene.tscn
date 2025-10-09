@@ -1,6 +1,6 @@
 [gd_scene load_steps=7 format=3 uid="uid://8hu3gkr3x5u"]
 
-[ext_resource type="Script" uid="uid://dl88cx2frflyx" path="res://src/Voxel/World.cs" id="1_p3qsx"]
+[ext_resource type="Script" uid="uid://dl88cx2frflyx" path="res://src/World/World.cs" id="1_p3qsx"]
 [ext_resource type="PackedScene" uid="uid://b8t83ks30rr0f" path="res://Assets/Scenes/player.tscn" id="2_1moq4"]
 
 [sub_resource type="StandardMaterial3D" id="StandardMaterial3D_p3qsx"]

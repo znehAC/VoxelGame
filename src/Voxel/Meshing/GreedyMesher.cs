@@ -2,20 +2,16 @@ using Godot;
 using System.Collections.Generic;
 using System.Threading;
 
-public struct MeshData
-{
-    public List<Vector3> Vertices;
-    public List<Vector3> Normals;
-    public List<Color> Colors;
-    public List<int> Indices;
-}
-
-public static class GreedyMesher
+public class GreedyMesher : BaseMesher
 {
 
-    public static MeshData GenerateMeshData(byte[] paddedVoxels, int size, VoxelDefinition[] definitions, CancellationToken token)
+    public MeshData GenerateMeshData(MeshJobData jobData, VoxelDefinition[] definitions, CancellationToken token)
     {
-        int paddedSize = size + 2;
+        const int size = Chunk.Size;
+        const int paddedSize = size + 2;
+
+        byte[] paddedVoxels = BuildPaddedVoxelsFromJobData(jobData);
+
         var vertices = new List<Vector3>();
         var normals = new List<Vector3>();
         var colors = new List<Color>();
@@ -40,7 +36,8 @@ public static class GreedyMesher
 
             for (x[axis] = -1; x[axis] < size; x[axis]++)
             {
-                // token.ThrowIfCancellationRequested();
+                token.ThrowIfCancellationRequested();
+
                 // 1. --- Build the 2D mask for the current slice ---
                 int n = 0;
                 for (x[v] = 0; x[v] < size; x[v]++)
@@ -73,7 +70,6 @@ public static class GreedyMesher
                         var (type, forwardFace) = mask[n];
                         if (type != 0)
                         {
-                            // Find width and height of the quad
                             int w;
                             for (w = 1; i + w < size && mask[n + w].type == type && mask[n + w].forwardFace == forwardFace; w++) { }
 
@@ -91,7 +87,6 @@ public static class GreedyMesher
                                 if (done) break;
                             }
 
-                            // Add the quad to the mesh data
                             x[u] = i;
                             x[v] = j;
 
@@ -149,5 +144,57 @@ public static class GreedyMesher
             }
         }
         return new MeshData { Vertices = vertices, Normals = normals, Colors = colors, Indices = indices };
+    }
+
+    private byte[] BuildPaddedVoxelsFromJobData(MeshJobData data)
+    {
+        const int size = Chunk.Size;
+        const int paddedSize = size + 2;
+        var paddedVoxels = new byte[paddedSize * paddedSize * paddedSize];
+
+        byte[] centerVoxels = data.CenterVoxels;
+        byte[] rightVoxels = data.NeighborVoxels[0];
+        byte[] leftVoxels = data.NeighborVoxels[1];
+        byte[] upVoxels = data.NeighborVoxels[2];
+        byte[] downVoxels = data.NeighborVoxels[3];
+        byte[] frontVoxels = data.NeighborVoxels[4];
+        byte[] backVoxels = data.NeighborVoxels[5];
+
+        for (int x = -1; x < size + 1; x++)
+        {
+            for (int y = -1; y < size + 1; y++)
+            {
+                for (int z = -1; z < size + 1; z++)
+                {
+                    int paddedIndex = ((z + 1) * paddedSize * paddedSize) + ((y + 1) * paddedSize) + (x + 1);
+                    byte voxelValue;
+
+                    if (x >= 0 && x < size && y >= 0 && y < size && z >= 0 && z < size)
+                    {
+                        // Case 1: Voxel is inside the main chunk's data.
+                        voxelValue = centerVoxels[(z * size * size) + (y * size) + x];
+                    }
+                    else
+                    {
+                        // Case 2: Voxel is in the padding (a neighbor chunk).
+                        int localX = (x + size) % size;
+                        int localY = (y + size) % size;
+                        int localZ = (z + size) % size;
+                        int neighborIndex = (localZ * size * size) + (localY * size) + localX;
+
+                        // Check which neighbor this coordinate falls into.
+                        if (x < 0 && leftVoxels != null) voxelValue = leftVoxels[neighborIndex];
+                        else if (x >= size && rightVoxels != null) voxelValue = rightVoxels[neighborIndex];
+                        else if (y < 0 && downVoxels != null) voxelValue = downVoxels[neighborIndex];
+                        else if (y >= size && upVoxels != null) voxelValue = upVoxels[neighborIndex];
+                        else if (z < 0 && backVoxels != null) voxelValue = backVoxels[neighborIndex];
+                        else if (z >= size && frontVoxels != null) voxelValue = frontVoxels[neighborIndex];
+                        else voxelValue = VoxelTypes.Air; // Fallback if a neighbor doesn't exist.
+                    }
+                    paddedVoxels[paddedIndex] = voxelValue;
+                }
+            }
+        }
+        return paddedVoxels;
     }
 }

@@ -15,7 +15,7 @@ public partial class PlayerController : CharacterBody3D
 
     private Camera3D _camera;
     private Vector2 _mouseDelta;
-    private bool _isFlying = false;
+    private bool _isFlying = true;
 
     public override void _Ready()
     {
