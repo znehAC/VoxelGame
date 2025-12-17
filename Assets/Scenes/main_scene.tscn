@@ -1,9 +1,10 @@
-[gd_scene load_steps=7 format=3 uid="uid://8hu3gkr3x5u"]
+[gd_scene load_steps=8 format=3 uid="uid://8hu3gkr3x5u"]
 
 [ext_resource type="Script" uid="uid://dl88cx2frflyx" path="res://src/World/World.cs" id="1_p3qsx"]
 [ext_resource type="PackedScene" uid="uid://b8t83ks30rr0f" path="res://Assets/Scenes/player.tscn" id="2_1moq4"]
+[ext_resource type="Resource" uid="uid://d16yxrq31b3qp" path="res://default_terrain_config.tres" id="2_xcvj3"]
 
-[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_p3qsx"]
+[sub_resource type="StandardMaterial3D" id="StandardMaterial3D_xcvj3"]
 vertex_color_use_as_albedo = true
 
 [sub_resource type="ProceduralSkyMaterial" id="ProceduralSkyMaterial_p3qsx"]
@@ -22,7 +23,8 @@ ambient_light_source = 3
 
 [node name="World" type="Node3D" node_paths=PackedStringArray("PerformanceLabel")]
 script = ExtResource("1_p3qsx")
-VoxelMaterial = SubResource("StandardMaterial3D_p3qsx")
+Config = ExtResource("2_xcvj3")
+VoxelMaterial = SubResource("StandardMaterial3D_xcvj3")
 PerformanceLabel = NodePath("UI/Performance")
 
 [node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]

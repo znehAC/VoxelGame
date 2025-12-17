@@ -1,76 +1,182 @@
 using Godot;
-using System.Collections.Generic;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using VoxelPowderSim.Src.Voxel.Data;
 
 public partial class World : Node3D
 {
+    // Use Resource type to prevent crash if user assigns a Script file
+    [Export] public Resource Config { get; set; }
+    public TerrainConfig ActiveConfig { get; private set; }
+
     [Export] public StandardMaterial3D VoxelMaterial { get; set; }
-    [Export] public int LoadRadius { get; set; } = 8;
-    [Export] public int WorldHeightInChunks { get; set; } = 10;
+    
+    // Kept for debug/metrics, logic moved to Config where possible
     [Export] private Label PerformanceLabel { get; set; }
     [Export] private bool _debugWireframe = false;
+    
+    public int Seed { get; private set; }
 
+    // Dictionary is now just a Lookup Cache for Mesher/Physics.
+    public readonly ConcurrentDictionary<Vector4I, Chunk> VoxelChunks = new();
 
-
-
-    [Export] public int MaxChunksToLoadPerFrame { get; set; } = 8;
-
-    public readonly ConcurrentDictionary<Vector3I, Chunk> VoxelChunks = new();
     private Node3D _player;
     private Camera3D _camera;
     private VoxelJobScheduler _jobScheduler;
     private BaseMesher _mesher;
-    private Vector3I _lastPlayerChunkPosition;
-    private bool _isPlayerSpawned = false;
     private ChunkPool _chunkPool;
-
+    
+    private ChunkOctree _octree;
+    private bool _isPlayerSpawned = false;
+    
     private double _worldStreamerTimer = 0.0;
-    private const double WorldStreamerInterval = 0.1;
-
-    private readonly List<Vector3I> _chunksToUnload = new();
-
+    private const double WorldStreamerInterval = 0.05; // 20 Hz
+            
     private readonly Queue<Chunk> _chunksAwaitingData = new();
     private readonly Queue<Chunk> _chunksAwaitingMesh = new();
 
-    private readonly FastNoiseLite _continentalnessNoise = new();
-    private readonly FastNoiseLite _erosionNoise = new();
-    private readonly FastNoiseLite _caveNoise = new();
+    // Phase 2: Floating Origin Accumulator
+    private Vector3 _worldOriginOffset = Vector3.Zero;
+    public Vector3 WorldOriginOffset => _worldOriginOffset;
 
     public override void _Ready()
     {
+        // 1. Load or Validate Config
+        if (Config is TerrainConfig tc)
+        {
+            ActiveConfig = tc;
+        }
+        else
+        {
+            if (Config != null)
+            {
+                GD.PrintErr($"[World] Assigned Config was not a TerrainConfig instance! (Type: {Config.GetType().Name}). Using Default.");
+            }
+            ActiveConfig = new TerrainConfig();
+        }
+
+        if (PerformanceLabel != null)
+        {
+             PerformanceLabel.AutowrapMode = TextServer.AutowrapMode.Word;
+        }
+
         _player = GetNode<Node3D>("Player");
         _camera = _player.GetNode<Camera3D>("Camera3D");
+        _camera.Far = ActiveConfig.OriginShiftThreshold * 1.5f; // Ensure frustum covers shift distance
+        
         _player.GetNode<CollisionShape3D>("CollisionShape3D").Disabled = true;
-        _lastPlayerChunkPosition = GetPlayerChunkPosition();
+
+        if (VoxelMaterial == null) VoxelMaterial = new StandardMaterial3D();
+        VoxelMaterial.VertexColorUseAsAlbedo = true;
+        VoxelMaterial.CullMode = BaseMaterial3D.CullModeEnum.Disabled;
+        VoxelMaterial.ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded;
+        
+        // Ensure Albedo Color is White so it doesn't tint vertex colors
+        VoxelMaterial.AlbedoColor = Colors.White;
+
+        GD.Print($"[Material Config] VertexColor: {VoxelMaterial.VertexColorUseAsAlbedo}, Cull: {VoxelMaterial.CullMode}");
+
+        // --- DEBUG RED CUBE ---
+        var debugCube = new MeshInstance3D();
+        debugCube.Mesh = new BoxMesh { Size = Vector3.One * 5.0f };
+        var redMat = new StandardMaterial3D { AlbedoColor = Colors.Red, ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded };
+        debugCube.MaterialOverride = redMat;
+        AddChild(debugCube);
+        debugCube.GlobalPosition = new Vector3(0, 105, -10); // In front of player spawn
+        GD.Print("Created Debug Red Cube at (0, 105, -10)");
+        // ---------------------
 
         _chunkPool = new ChunkPool(this);
-        SetupNoise();
+        Seed = (int)GD.Randi();
 
-
-        _mesher = new CulledMesher();
-        _jobScheduler = new VoxelJobScheduler(this, _continentalnessNoise, _erosionNoise, _caveNoise, _mesher);
+        _mesher = new GreedyMesher();
+        
+        _jobScheduler = new VoxelJobScheduler(this, _mesher, Seed);
         _jobScheduler.Start();
+        
+        // Initialize Octree (Used for Fixed Mode)
+        _octree = new ChunkOctree(this, _chunkPool);
 
-
+        GD.Print($"World Initialized. Mode: {ActiveConfig.Mode}, Scale: {ActiveConfig.VoxelScale}");
     }
 
     public override void _Process(double delta)
     {
         _worldStreamerTimer += delta;
-        if (_worldStreamerTimer >= WorldStreamerInterval)
+        
+        // Phase 2: Infinite Scrolling & Origin Shifting
+        if (ActiveConfig.Mode == TerrainConfig.WorldMode.Infinite)
         {
-            Vector3I playerChunkPos = GetPlayerChunkPosition();
-
-
-            UpdateWorldStreamer(playerChunkPos);
-            _lastPlayerChunkPosition = playerChunkPos;
-
-            _worldStreamerTimer = 0.0;
+            CheckFloatingOrigin();
+            
+            if (_worldStreamerTimer >= WorldStreamerInterval)
+            {
+                // Unified Octree Logic
+                Vector3 logicalPos = _player.GlobalPosition + _worldOriginOffset;
+                _octree.Update(logicalPos);
+                _worldStreamerTimer = 0.0;
+            }
+        }
+        else // Fixed Mode
+        {
+            if (_worldStreamerTimer >= WorldStreamerInterval)
+            {
+                // Fixed mode assumes origin at 0, no shift
+                _octree.Update(_player.GlobalPosition);
+                _worldStreamerTimer = 0.0;
+            }
         }
 
         ProcessJobResults();
         ProcessStateTransitions();
         UpdateMetrics();
+    }
+
+    private void CheckFloatingOrigin()
+    {
+        float dist = _player.Position.Length();
+        if (dist > ActiveConfig.OriginShiftThreshold)
+        {
+            Vector3 shift = -_player.Position;
+            ApplyWorldShift(shift);
+        }
+    }
+
+    private void ApplyWorldShift(Vector3 shift)
+    {
+        // 1. Shift Player (Reset to near zero)
+        _player.Position += shift;
+
+        // 2. Accumulate Shift (for Logical <-> Physical conversion if needed later)
+        _worldOriginOffset -= shift;
+
+        // 3. Shift Active Chunks
+        // Note: Chunk.Position is the LOGICAL coordinate (Index).
+        // We shift the VISUAL representation (MeshInstance).
+        foreach (var kvp in VoxelChunks)
+        {
+            Chunk chunk = kvp.Value;
+            if (GodotObject.IsInstanceValid(chunk.MeshInstance))
+            {
+                chunk.MeshInstance.Position += shift;
+            }
+        }
+
+        GD.Print($"[World] Floating Origin Shift: {shift}. Total Offset: {_worldOriginOffset}");
+    }
+
+    // Called by Octree or Infinite Loop
+    public void RequestChunkLoad(Chunk chunk)
+    {
+        if (chunk.State == ChunkState.AwaitingData)
+        {
+            chunk.SetVisible(false);
+            if (!_chunksAwaitingData.Contains(chunk))
+            {
+                _chunksAwaitingData.Enqueue(chunk);
+            }
+        }
     }
 
     public override void _Input(InputEvent e)
@@ -81,116 +187,55 @@ public partial class World : Node3D
         }
     }
 
-
-
-    private void UpdateWorldStreamer(Vector3I playerChunkPos)
+    private void ToggleWireframe()
     {
-        var requiredPositions = new HashSet<Vector3I>();
-        var chunksToLoad = new List<(Vector3I pos, float priority)>();
-        var playerForward = -_camera.GlobalTransform.Basis.Z;
-
-
-        for (int x = -LoadRadius; x <= LoadRadius; x++)
-        {
-            for (int z = -LoadRadius; z <= LoadRadius; z++)
-            {
-
-                for (int y = LoadRadius; y >= -LoadRadius; y--)
-                {
-                    var chunkPos = playerChunkPos + new Vector3I(x, y, z);
-                    requiredPositions.Add(chunkPos);
-
-
-                    if (VoxelChunks.TryGetValue(chunkPos, out var chunk) && chunk.IsFullyOpaque)
-                    {
-
-
-                        break;
-                    }
-
-                    if (!VoxelChunks.ContainsKey(chunkPos))
-                    {
-
-                        var chunkWorldCenter = (Vector3)chunkPos * Chunk.Size + (Vector3.One * (Chunk.Size / 2f));
-                        var directionToChunk = (chunkWorldCenter - _player.GlobalPosition).Normalized();
-                        var distance = playerChunkPos.DistanceTo(chunkPos);
-
-                        float dot = playerForward.Dot(directionToChunk);
-                        float priority = (1.0f / Mathf.Max(1.0f, distance)) * (dot + 1.1f);
-
-                        chunksToLoad.Add((chunkPos, priority));
-                    }
-                }
-            }
-        }
-
-
-        _chunksToUnload.Clear();
-        foreach (var pos in VoxelChunks.Keys)
-        {
-            if (!requiredPositions.Contains(pos))
-            {
-                _chunksToUnload.Add(pos);
-            }
-        }
-
-        foreach (var pos in _chunksToUnload)
-        {
-            if (VoxelChunks.TryRemove(pos, out var chunk))
-            {
-                chunk.Unload();
-                _chunkPool.Return(chunk);
-            }
-        }
-
-
-
-        chunksToLoad.Sort((a, b) => b.priority.CompareTo(a.priority));
-
-
-        int chunksLoadedThisFrame = 0;
-        foreach (var (pos, _) in chunksToLoad)
-        {
-            if (chunksLoadedThisFrame >= MaxChunksToLoadPerFrame)
-            {
-                break;
-            }
-
-
-            if (VoxelChunks.ContainsKey(pos)) continue;
-
-            var newChunk = _chunkPool.Get(pos);
-            newChunk.InitializeMeshNode(this, VoxelMaterial);
-            if (VoxelChunks.TryAdd(pos, newChunk))
-            {
-                _chunksAwaitingData.Enqueue(newChunk);
-                chunksLoadedThisFrame++;
-            }
-        }
+        _debugWireframe = !_debugWireframe;
+        GetViewport().DebugDraw = _debugWireframe ? Viewport.DebugDrawEnum.Wireframe : Viewport.DebugDrawEnum.Disabled;
     }
-
 
     private void ProcessJobResults()
     {
-        const int MaxMeshesPerFrame = 8;
+        const int MaxMeshesPerFrame = 64;
         int meshesApplied = 0;
 
         while (meshesApplied < MaxMeshesPerFrame && _jobScheduler.TryDequeueResult(out var result))
         {
             var (job, data) = result;
-            if (VoxelChunks.TryGetValue(job.Position, out var chunk))
+            var key = new Vector4I(job.Position.X, job.Position.Y, job.Position.Z, job.Lod);
+            
+            if (VoxelChunks.TryGetValue(key, out var chunk))
             {
-
                 switch (job.JobType)
                 {
                     case VoxelJobType.GenerateData:
-                        chunk.State = ChunkState.AwaitingMesh;
-                        _chunksAwaitingMesh.Enqueue(chunk);
+                        if (data is (byte[] voxels, bool isEmpty))
+                        {
+                            chunk.SetVoxels(voxels, isEmpty);
+                            
+                            if (chunk.IsEmpty) 
+                            {
+                                chunk.State = ChunkState.Ready;
+                            }
+                            else
+                            {
+                                chunk.State = ChunkState.AwaitingMesh;
+                                _chunksAwaitingMesh.Enqueue(chunk);
+                            }
+                        }
                         break;
                     case VoxelJobType.GenerateMesh when data is MeshData meshData:
                         chunk.ApplyMeshData(meshData);
+                        if (chunk.Lod == 0) chunk.ApplyCollisionData(meshData);
                         chunk.State = ChunkState.Ready;
-                        if (!_isPlayerSpawned) TrySpawnPlayer();
+                        
+                        // Force visibility ON for Infinite Mode (or let Octree handle it in Fixed)
+                        // Ideally, we just turn it on. Octree will hide it if needed next frame.
+                        chunk.SetVisible(true);
+                        
+                        if (chunk.Lod == 0 && chunk.Position == new Vector3I(0, 1, 0))
+                        {
+                             TrySpawnPlayer();
+                        }
                         meshesApplied++;
                         break;
                 }
@@ -200,29 +245,31 @@ public partial class World : Node3D
 
     private void ProcessStateTransitions()
     {
-        const int ChunksToProcessPerFrame = 64;
+        const int ChunksToProcessPerFrame = 128;
 
-
+        // 1. Data Generation
         int dataQueueCount = _chunksAwaitingData.Count;
         for (int i = 0; i < dataQueueCount && i < ChunksToProcessPerFrame; i++)
         {
             if (_chunksAwaitingData.TryDequeue(out var chunk))
             {
-                if (chunk.State == ChunkState.AwaitingData)
+                var key = new Vector4I(chunk.Position.X, chunk.Position.Y, chunk.Position.Z, chunk.Lod);
+                if (VoxelChunks.ContainsKey(key) && chunk.State == ChunkState.AwaitingData)
                 {
                     chunk.State = ChunkState.GeneratingData;
-
-                    _jobScheduler.EnqueueJob(new VoxelJob(chunk.Position, VoxelJobType.GenerateData, chunk.JobCancellationTokenSource.Token));
+                    _jobScheduler.EnqueueJob(new VoxelJob(chunk.Position, VoxelJobType.GenerateData, chunk.JobCancellationTokenSource.Token, chunk.Lod));
                 }
-
             }
         }
 
-
+        // 2. Mesh Generation
         int meshQueueCount = _chunksAwaitingMesh.Count;
         for (int i = 0; i < meshQueueCount && i < ChunksToProcessPerFrame; i++)
         {
             if (!_chunksAwaitingMesh.TryDequeue(out var chunk)) continue;
+
+             var key = new Vector4I(chunk.Position.X, chunk.Position.Y, chunk.Position.Z, chunk.Lod);
+             if (!VoxelChunks.ContainsKey(key)) continue; 
 
             if (chunk.State == ChunkState.AwaitingMesh)
             {
@@ -232,23 +279,31 @@ public partial class World : Node3D
                 for (int j = 0; j < VoxelUtils.NeighborOffsets.Length; j++)
                 {
                     var neighborPos = chunk.Position + VoxelUtils.NeighborOffsets[j];
-                    if (VoxelChunks.TryGetValue(neighborPos, out var neighbor) && neighbor.State >= ChunkState.AwaitingMesh)
+                    var neighborKey = new Vector4I(neighborPos.X, neighborPos.Y, neighborPos.Z, chunk.Lod);
+                    
+                    if (VoxelChunks.TryGetValue(neighborKey, out var neighbor))
                     {
-                        neighbors[j] = neighbor;
+                        if (neighbor.State >= ChunkState.AwaitingMesh) 
+                        {
+                            neighbors[j] = neighbor;
+                        }
+                        else 
+                        {
+                            allNeighborsReady = false; 
+                            break; 
+                        }
                     }
-                    else
+                    else 
                     {
-                        allNeighborsReady = false;
-                        break;
+                        neighbors[j] = null;
                     }
                 }
 
                 if (allNeighborsReady)
                 {
                     chunk.State = ChunkState.Meshing;
-
                     var meshJobData = new MeshJobData(chunk, neighbors);
-                    _jobScheduler.EnqueueJob(new VoxelJob(chunk.Position, VoxelJobType.GenerateMesh, chunk.JobCancellationTokenSource.Token, meshJobData));
+                    _jobScheduler.EnqueueJob(new VoxelJob(chunk.Position, VoxelJobType.GenerateMesh, chunk.JobCancellationTokenSource.Token, chunk.Lod, meshJobData));
                 }
                 else
                 {
@@ -258,54 +313,38 @@ public partial class World : Node3D
         }
     }
 
-
     private void TrySpawnPlayer()
     {
         if (_isPlayerSpawned) return;
-
-        if (VoxelChunks.TryGetValue(Vector3I.Zero, out var chunk) && chunk.State == ChunkState.Ready)
+        
+        var shape = _player.GetNode<CollisionShape3D>("CollisionShape3D");
+        if (shape.Disabled)
         {
+            GD.Print("--- SPAWN CHUNK READY! TELEPORTING & ENABLING PLAYER ---");
+            // Spawn high to avoid falling through terrain, but respect scale
+            // Old: 100 units. New: 100 * Scale (e.g. 10m)
+            float spawnY = 100.0f * ActiveConfig.VoxelScale;
+            _player.GlobalPosition = new Vector3(0, spawnY, 0);
+            shape.Disabled = false;
             _isPlayerSpawned = true;
-            GD.Print("--- SPAWN CHUNK READY! ENABLING PLAYER ---");
-            _player.GetNode<CollisionShape3D>("CollisionShape3D").Disabled = false;
         }
     }
-    private Vector3I GetPlayerChunkPosition() =>
-        new((int)Mathf.Floor(_player.GlobalPosition.X / Chunk.Size),
-            (int)Mathf.Floor(_player.GlobalPosition.Y / Chunk.Size),
-            (int)Mathf.Floor(_player.GlobalPosition.Z / Chunk.Size));
-
-    private void SetupNoise()
-    {
-        var seed = (int)GD.Randi();
-
-        _continentalnessNoise.Seed = seed;
-        _continentalnessNoise.Frequency = 0.002f;
-        _continentalnessNoise.FractalType = FastNoiseLite.FractalTypeEnum.Fbm;
-
-        _erosionNoise.Seed = seed + 1;
-        _erosionNoise.Frequency = 0.008f;
-        _erosionNoise.FractalType = FastNoiseLite.FractalTypeEnum.Ridged;
-
-        _caveNoise.Seed = seed + 2;
-        _caveNoise.Frequency = 0.02f;
-        _caveNoise.FractalType = FastNoiseLite.FractalTypeEnum.Ridged;
-    }
-
+    
     private void UpdateMetrics()
     {
         if (PerformanceLabel == null) return;
         double fps = Performance.GetMonitor(Performance.Monitor.TimeFps);
         long verts = (long)Performance.GetMonitor(Performance.Monitor.RenderTotalPrimitivesInFrame);
-        PerformanceLabel.Text = $"FPS: {fps:F0}\nVertices: {verts}\nChunks: {VoxelChunks.Count}";
-    }
+        double mem = Process.GetCurrentProcess().PrivateMemorySize64 / (1024.0 * 1024.0);
+        
+        int loadedChunks = VoxelChunks.Count;
+        int readyChunks = 0;
+        foreach (var c in VoxelChunks.Values) if (c.State == ChunkState.Ready) readyChunks++;
+        
+        Vector3 p = _player.GlobalPosition;
+        // Show Real + Virtual Position
+        Vector3 logicalPos = p + _worldOriginOffset;
 
-    private void ToggleWireframe()
-    {
-        _debugWireframe = !_debugWireframe;
-        GD.Print("Wireframe: " + _debugWireframe);
-
-        var vp = GetViewport();
-        vp.DebugDraw = _debugWireframe ? Viewport.DebugDrawEnum.Wireframe : Viewport.DebugDrawEnum.Disabled;
+        PerformanceLabel.Text = $"FPS: {fps:F0} | Verts: {verts} | Mem: {mem:F0} MB | Chunks: {loadedChunks} ({readyChunks} Ready)\nVisPos: {p.X:F1}, {p.Y:F1}, {p.Z:F1}\nLogPos: {logicalPos.X:F1}, {logicalPos.Y:F1}, {logicalPos.Z:F1}";
     }
 }

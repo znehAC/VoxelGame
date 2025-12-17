@@ -90,7 +90,13 @@ public class CulledMesher : BaseMesher
                 }
             }
         }
-        return new MeshData { Vertices = vertices, Normals = normals, Colors = colors, Indices = indices };
+        return new MeshData 
+        { 
+            Vertices = vertices.ToArray(), 
+            Normals = normals.ToArray(), 
+            Colors = colors.ToArray(), 
+            Indices = indices.ToArray() 
+        };
     }
 
     private byte GetVoxelFromJobData(MeshJobData data, int x, int y, int z)

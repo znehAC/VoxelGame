@@ -24,6 +24,11 @@ public static class VoxelTypes
     public const byte Stone = 2;
     public const byte Grass = 3;
     public const byte Water = 4;
+    public const byte Snow = 5;
+    public const byte Sand = 6;
+    public const byte Wood = 7;
+    public const byte RedStone = 8;
+    public const byte BlueStone = 9;
 
     public static readonly VoxelDefinition[] Definitions = new VoxelDefinition[]
     {
@@ -37,9 +42,24 @@ public static class VoxelTypes
         new VoxelDefinition("Stone", new Color(0.5f, 0.5f, 0.5f), isSolid: true),
 
         // 3: Grass
-        new VoxelDefinition("Dirt", new Color(0.54f, 0.27f, 0.07f), isSolid: true),
+        new VoxelDefinition("Grass", new Color(0.0f, 1.0f, 0.0f), isSolid: true),
 
         // 4: Water
-        new VoxelDefinition("Dirt", new Color(0.54f, 0.27f, 0.07f), isSolid: true),
+        new VoxelDefinition("Water", new Color(0.0f, 0.0f, 1.0f), isSolid: true),
+
+        // 5: Snow (White)
+        new VoxelDefinition("Snow", new Color(0.9f, 0.9f, 0.9f), isSolid: true),
+
+        // 6: Sand (Yellow)
+        new VoxelDefinition("Sand", new Color(0.94f, 0.90f, 0.55f), isSolid: true),
+
+        // 7: Wood (Dark Brown)
+        new VoxelDefinition("Wood", new Color(0.4f, 0.2f, 0.0f), isSolid: true),
+
+        // 8: RedStone (Red)
+        new VoxelDefinition("RedStone", new Color(0.8f, 0.1f, 0.1f), isSolid: true),
+
+        // 9: BlueStone (Blue)
+        new VoxelDefinition("BlueStone", new Color(0.1f, 0.1f, 0.8f), isSolid: true),
     };
 }

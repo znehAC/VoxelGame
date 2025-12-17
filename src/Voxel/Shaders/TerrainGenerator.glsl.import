@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://dhdhkkuykv5qd"
+path="res://.godot/imported/TerrainGenerator.glsl-4961f4bb4b8c7b0aa14bacebcc27ad97.res"
+
+[deps]
+
+source_file="res://src/Voxel/Shaders/TerrainGenerator.glsl"
+dest_files=["res://.godot/imported/TerrainGenerator.glsl-4961f4bb4b8c7b0aa14bacebcc27ad97.res"]
+
+[params]
+

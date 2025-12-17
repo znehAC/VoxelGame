@@ -1,0 +1,7 @@
+[gd_resource type="Resource" load_steps=2 format=3 uid="uid://d16yxrq31b3qp"]
+
+[ext_resource type="Script" uid="uid://b8lg7ncvo6ud2" path="res://src/Voxel/Data/TerrainConfig.cs" id="1_script"]
+
+[resource]
+script = ExtResource("1_script")
+VoxelScale = 1.0

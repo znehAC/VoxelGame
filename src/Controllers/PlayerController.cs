@@ -14,13 +14,21 @@ public partial class PlayerController : CharacterBody3D
     public float Gravity = ProjectSettings.GetSetting("physics/3d/default_gravity").AsSingle() * 30;
 
     private Camera3D _camera;
+    private CollisionShape3D _collisionShape;
     private Vector2 _mouseDelta;
     private bool _isFlying = true;
 
     public override void _Ready()
     {
         _camera = GetNode<Camera3D>("Camera3D");
+        _collisionShape = GetNode<CollisionShape3D>("CollisionShape3D");
         Input.MouseMode = Input.MouseModeEnum.Captured;
+        
+        // Ensure initial state matches
+        if (_collisionShape != null)
+        {
+             _collisionShape.Disabled = _isFlying;
+        }
     }
 
     public override void _Input(InputEvent e)
@@ -41,12 +49,19 @@ public partial class PlayerController : CharacterBody3D
         if (e.IsActionPressed("toggle_fly"))
         {
             _isFlying = !_isFlying;
-            GD.Print($"Flying: {_isFlying}");
+            if (_collisionShape != null) _collisionShape.Disabled = _isFlying;
+            GD.Print($"Flying: {_isFlying}, Collision Disabled: {_isFlying}");
         }
     }
 
     public override void _PhysicsProcess(double delta)
     {
+        // Enforce flying collision state (fixes World.cs overriding it on spawn)
+        if (_isFlying && _collisionShape != null && !_collisionShape.Disabled)
+        {
+            _collisionShape.Disabled = true;
+        }
+
         // --- Mouselook Rotation ---
         HandleMouseLook();
         _mouseDelta = Vector2.Zero; // Reset delta each frame
