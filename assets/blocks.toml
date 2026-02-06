@@ -1,0 +1,54 @@
+[[block]]
+id = "engine:stone"
+name = "Stone"
+color = "#808080"
+roughness = 0.9
+
+[[block]]
+id = "engine:dirt"
+name = "Dirt"
+color = "#8B6914"
+roughness = 0.95
+noise = 0.3
+
+[[block]]
+id = "engine:grass"
+name = "Grass"
+color = "#4CAF50"
+roughness = 0.85
+noise = 0.2
+
+[[block]]
+id = "engine:sand"
+name = "Sand"
+color = "#F4D03F"
+roughness = 0.7
+noise = 0.1
+
+[[block]]
+id = "engine:water"
+name = "Water"
+color = "#2196F3"
+roughness = 0.1
+metallic = 0.3
+
+[[block]]
+id = "engine:wood"
+name = "Wood"
+color = "#795548"
+roughness = 0.8
+noise = 0.4
+
+[[block]]
+id = "engine:leaves"
+name = "Leaves"
+color = "#2E7D32"
+roughness = 0.9
+noise = 0.5
+
+[[block]]
+id = "engine:lava"
+name = "Lava"
+color = "#FF5722"
+emission = 1.0
+roughness = 0.3

@@ -1,0 +1,10 @@
+[package]
+name = "ara-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+glam = { workspace = true }
+bytemuck = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
