@@ -22,8 +22,16 @@ pub struct GlobalUniforms {
     pub time: f32,
     /// Viewport resolution (width, height).
     pub resolution: [f32; 2],
-    /// Padding for 16-byte alignment.
-    pub _padding: f32,
+    /// Max shadow ray distance for sun occlusion.
+    pub sun_shadow_max: f32,
+    /// Sun direction (.xyz = normalized direction, .w = intensity).
+    pub sun_dir: Vec4,
+    /// Sun color (.rgb = color, .a = unused).
+    pub sun_color: Vec4,
+    /// Sky hemisphere color (.rgb = color, .a = sky_intensity).
+    pub sky_color: Vec4,
+    /// Ground hemisphere color (.rgb = color, .a = unused).
+    pub ground_color: Vec4,
 }
 
 impl GlobalUniforms {
@@ -34,7 +42,15 @@ impl GlobalUniforms {
         cam_pos: [f32; 3],
         time: f32,
         resolution: [f32; 2],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        sun_color: [f32; 3],
+        sky_color: [f32; 3],
+        sky_intensity: f32,
+        ground_color: [f32; 3],
+        sun_shadow_max: f32,
     ) -> Self {
+        let sd = glam::Vec3::from_array(sun_dir).normalize_or_zero();
         Self {
             view_inverse: [
                 Vec4::from_array(view_inverse[0]),
@@ -51,7 +67,11 @@ impl GlobalUniforms {
             cam_pos: Vec4::new(cam_pos[0], cam_pos[1], cam_pos[2], 0.0),
             time,
             resolution,
-            _padding: 0.0,
+            sun_shadow_max,
+            sun_dir: Vec4::new(sd.x, sd.y, sd.z, sun_intensity),
+            sun_color: Vec4::new(sun_color[0], sun_color[1], sun_color[2], 0.0),
+            sky_color: Vec4::new(sky_color[0], sky_color[1], sky_color[2], sky_intensity),
+            ground_color: Vec4::new(ground_color[0], ground_color[1], ground_color[2], 0.0),
         }
     }
 }
@@ -171,8 +191,9 @@ mod tests {
 
     #[test]
     fn global_uniforms_layout() {
-        // view_inverse (64) + proj_inverse (64) + cam_pos (16) + time+resolution+padding (16) = 160
-        assert_eq!(size_of::<GlobalUniforms>(), 160);
+        // view_inverse (64) + proj_inverse (64) + cam_pos (16) + time+resolution+padding (16)
+        // + sun_dir (16) + sun_color (16) + sky_color (16) + ground_color (16) = 224
+        assert_eq!(size_of::<GlobalUniforms>(), 224);
         assert_eq!(align_of::<GlobalUniforms>(), 16);
     }
 

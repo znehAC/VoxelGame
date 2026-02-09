@@ -4,6 +4,7 @@
 //! No GPU dependencies.
 
 pub mod input;
+pub mod raycast;
 pub mod registry;
 pub mod types;
 pub mod voxel;
@@ -12,6 +13,7 @@ pub use bytemuck;
 pub use glam;
 
 pub use input::{Action, InputManager};
+pub use raycast::{dda_raycast, RayHit};
 pub use registry::BlockRegistry;
 pub use types::{CameraPushConstants, GlobalUniforms, InputState};
 pub use voxel::PackedVoxel;

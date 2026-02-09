@@ -5,7 +5,11 @@ struct GlobalUniforms {
     time: f32,
     resolution_x: f32,
     resolution_y: f32,
-    _pad: f32,
+    sun_shadow_max: f32,
+    sun_dir: vec4f,
+    sun_color: vec4f,
+    sky_color: vec4f,
+    ground_color: vec4f,
 }
 
 struct VoxelData {
@@ -55,62 +59,61 @@ fn get_voxel_at(pos: vec3i) -> bool {
     return (packed & 0xFFFFu) != 0u;
 }
 
+fn vertex_ao(side1: f32, side2: f32, corner: f32) -> f32 {
+    // Both sides solid → fully occluded regardless of corner
+    if side1 > 0.5 && side2 > 0.5 {
+        return 0.0;
+    }
+    return (3.0 - side1 - side2 - corner) / 3.0;
+}
+
 fn get_ao(pos: vec3f, normal: vec3f) -> f32 {
+    // Air voxel adjacent to the hit surface
     let p = vec3i(floor(pos + normal * 0.5));
-    
-    // We want to sample the 4 neighbors around the vertex on the face
-    // But since we are raymarching, we have a hit position which is anywhere on the face.
-    // A simple AO valid for blocks is to check the 4 diagonal neighbors responsible for occlusion on that face.
 
-    // Let's create a basis.
-    var u = vec3f(0.0);
-    var v = vec3f(0.0);
-
-    if (abs(normal.x) > 0.5) {
-        u = vec3f(0.0, 1.0, 0.0);
-        v = vec3f(0.0, 0.0, 1.0);
-    } else if (abs(normal.y) > 0.5) {
-        u = vec3f(1.0, 0.0, 0.0);
-        v = vec3f(0.0, 0.0, 1.0);
+    // Tangent basis for the hit face
+    var tang: vec3i;
+    var bitang: vec3i;
+    if abs(normal.x) > 0.5 {
+        tang = vec3i(0, 1, 0);
+        bitang = vec3i(0, 0, 1);
+    } else if abs(normal.y) > 0.5 {
+        tang = vec3i(1, 0, 0);
+        bitang = vec3i(0, 0, 1);
     } else {
-        u = vec3f(1.0, 0.0, 0.0);
-        v = vec3f(0.0, 1.0, 0.0);
+        tang = vec3i(1, 0, 0);
+        bitang = vec3i(0, 1, 0);
     }
 
-    // Determine uv coordinates on the face (0..1)
-    let rel = pos - (vec3f(p) + vec3f(0.5));
-    let uv = vec2f(dot(rel, u), dot(rel, v)) + 0.5; // 0..1
+    // UV coordinate on the face [0..1]
+    let center = vec3f(p) + 0.5;
+    let rel = pos - center;
+    let u = dot(rel, vec3f(tang)) + 0.5;
+    let v = dot(rel, vec3f(bitang)) + 0.5;
 
-    // Neighbor offsets
-    let off_u = vec3i(u);
-    let off_v = vec3i(v);
+    // 8 neighbors in the face-tangent plane: 4 edges + 4 corners
+    //   02  12  22
+    //   01  --  21
+    //   00  10  20
+    let s00 = select(0.0, 1.0, get_voxel_at(p - tang - bitang));
+    let s10 = select(0.0, 1.0, get_voxel_at(p       - bitang));
+    let s20 = select(0.0, 1.0, get_voxel_at(p + tang - bitang));
+    let s01 = select(0.0, 1.0, get_voxel_at(p - tang));
+    let s21 = select(0.0, 1.0, get_voxel_at(p + tang));
+    let s02 = select(0.0, 1.0, get_voxel_at(p - tang + bitang));
+    let s12 = select(0.0, 1.0, get_voxel_at(p       + bitang));
+    let s22 = select(0.0, 1.0, get_voxel_at(p + tang + bitang));
 
-    // Check 4 corners (neighbors)
-    //  3 -- 2
-    //  |    |
-    //  0 -- 1
-    
-    // Neighbors in the plane perpendicular to normal
-    let n0 = get_voxel_at(p - off_u - off_v);
-    let n1 = get_voxel_at(p + off_u - off_v);
-    let n2 = get_voxel_at(p + off_u + off_v);
-    let n3 = get_voxel_at(p - off_u + off_v);
+    // Per-vertex AO: each vertex uses its 2 adjacent edges + 1 diagonal corner
+    let ao0 = vertex_ao(s01, s10, s00);
+    let ao1 = vertex_ao(s21, s10, s20);
+    let ao2 = vertex_ao(s21, s12, s22);
+    let ao3 = vertex_ao(s01, s12, s02);
 
-    // 0 means occluded, 1 means clear.
-    let occ0 = select(1.0, 0.0, n0);
-    let occ1 = select(1.0, 0.0, n1);
-    let occ2 = select(1.0, 0.0, n2);
-    let occ3 = select(1.0, 0.0, n3);
+    // Bilinear interpolation across the face
+    let ao = mix(mix(ao0, ao1, u), mix(ao3, ao2, u), v);
 
-    // Bilinear interpolation
-    let ao = mix(
-        mix(occ0, occ1, uv.x),
-        mix(occ3, occ2, uv.x),
-        uv.y
-    );
-    
-    // Curve it for strength
-    return smoothstep(0.0, 1.0, ao * 0.5 + 0.5);
+    return pow(ao, 1.5);
 }
 
 fn ray_aabb(origin: vec3f, inv_dir: vec3f, box_min: vec3f, box_max: vec3f) -> vec2f {
@@ -121,6 +124,79 @@ fn ray_aabb(origin: vec3f, inv_dir: vec3f, box_min: vec3f, box_max: vec3f) -> ve
     let t_enter = max(max(tmin.x, tmin.y), tmin.z);
     let t_exit = min(min(tmax.x, tmax.y), tmax.z);
     return vec2f(t_enter, t_exit);
+}
+
+fn trace_visibility(origin: vec3f, dir: vec3f, max_dist: f32) -> f32 {
+    let inv_dir = 1.0 / dir;
+    let bounds = ray_aabb(origin, inv_dir, vec3f(0.0), vec3f(f32(GRID_SIZE)));
+    var t_enter = bounds.x;
+    let t_exit = bounds.y;
+
+    if t_enter > t_exit || t_exit < 0.0 {
+        return 1.0;
+    }
+
+    t_enter = max(t_enter, 0.0);
+    let entry = origin + dir * (t_enter + 0.001);
+
+    var cell = vec3i(floor(entry));
+    cell = clamp(cell, vec3i(0), vec3i(i32(GRID_SIZE) - 1));
+
+    let step = vec3i(sign(dir));
+    let t_delta = abs(1.0 / dir);
+
+    var t_max: vec3f;
+    if dir.x > 0.0 { t_max.x = (f32(cell.x + 1) - entry.x) * abs(inv_dir.x); }
+    else { t_max.x = (entry.x - f32(cell.x)) * abs(inv_dir.x); }
+    if dir.y > 0.0 { t_max.y = (f32(cell.y + 1) - entry.y) * abs(inv_dir.y); }
+    else { t_max.y = (entry.y - f32(cell.y)) * abs(inv_dir.y); }
+    if dir.z > 0.0 { t_max.z = (f32(cell.z + 1) - entry.z) * abs(inv_dir.z); }
+    else { t_max.z = (entry.z - f32(cell.z)) * abs(inv_dir.z); }
+
+    if get_voxel_at(cell) {
+        return 0.0;
+    }
+
+    for (var i = 0u; i < MAX_STEPS; i++) {
+        var t_step: f32;
+        if t_max.x < t_max.y {
+            if t_max.x < t_max.z {
+                t_step = t_max.x;
+                cell.x += step.x;
+                t_max.x += t_delta.x;
+            } else {
+                t_step = t_max.z;
+                cell.z += step.z;
+                t_max.z += t_delta.z;
+            }
+        } else {
+            if t_max.y < t_max.z {
+                t_step = t_max.y;
+                cell.y += step.y;
+                t_max.y += t_delta.y;
+            } else {
+                t_step = t_max.z;
+                cell.z += step.z;
+                t_max.z += t_delta.z;
+            }
+        }
+
+        if t_enter + t_step > max_dist {
+            return 1.0;
+        }
+
+        if cell.x < 0 || cell.x >= i32(GRID_SIZE) ||
+           cell.y < 0 || cell.y >= i32(GRID_SIZE) ||
+           cell.z < 0 || cell.z >= i32(GRID_SIZE) {
+            return 1.0;
+        }
+
+        if get_voxel_at(cell) {
+            return 0.0;
+        }
+    }
+
+    return 1.0;
 }
 
 fn dda_march(origin: vec3f, dir: vec3f) -> HitResult {
@@ -263,7 +339,12 @@ fn hash33(p: vec3f) -> vec3f {
     return fract((p3.xxy + p3.yzz) * p3.zyx);
 }
 
-fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
+fn interleaved_gradient_noise(pixel_pos: vec2f) -> f32 {
+    let magic = vec3f(0.06711056, 0.00583715, 52.9829189);
+    return fract(magic.z * fract(dot(pixel_pos, magic.xy)));
+}
+
+fn shade_pbr(hit: HitResult, dir: vec3f, screen_pos: vec2f) -> vec3f {
     let pu = hit.voxel.id % 256u;
     let pv = hit.voxel.id / 256u;
     let coords = vec2i(i32(pu), i32(pv));
@@ -281,7 +362,7 @@ fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
 
     // Emission: lava glow
     // Scale up emission to make it bloom
-    let emit = albedo * emission * 10.0;
+    let emit = albedo * emission * 2.0;
 
     // Apply Noise Variation to Albedo
     // Use the voxel integer coordinate to seed the hash for variation.
@@ -289,27 +370,39 @@ fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
     let noise_val = hash(voxel_pos);
     
     // Modulate albedo based on noise strength (e.g. stone has high variation).
+    // Modulate albedo based on noise strength (e.g. stone has high variation).
     let noise_mod = 1.0 - (noise_strength * noise_val * 0.5);
     let noisy_albedo = albedo * noise_mod;
 
-    // Sample Light from Voxel Grid
-    // Offset slightly along normal to sample the "air" block next to the surface
-    let light_uvw = (hit.pos + hit.normal * 0.5) / vec3f(f32(GRID_SIZE));
+    // Sample Light from Voxel Grid (Indirect Lighting)
+    // Offset significantly along normal to allow Linear Interpolation across the face
+    let light_uvw = (hit.pos + hit.normal * 0.1) / vec3f(f32(GRID_SIZE));
     
-    // Sample Level 0 to avoid mipmap issues with manual gradient
+    // Sample Level 0. Linear filtering enabled.
+    // No more thresholding or clamping. Dark is dark.
     let voxel_light = textureSampleLevel(t_light, s_light, light_uvw, 0.0).rgb;
 
     // Calculate AO
-    let ao = get_ao(hit.pos, hit.normal);
+    // AO affects Indirect (voxel) light.
+    let ao_val = get_ao(hit.pos, hit.normal);
+    // Soften AO slightly so it's not pitch black in corners immediately, but keep it strong.
+    // Or strictly: AO * Light. Let's stick to simple multiplication for physical consistency.
+    let ao = pow(ao_val, 1.0); // Simple linear usage of AO factor
 
-    // Pure Voxel Lighting Model
-    // No analytical sun. The "sun" is just bright voxels in the light texture.
+    // Sun directional light (Direct Lighting)
+    let ndotl = max(dot(hit.normal, -globals.sun_dir.xyz), 0.0);
+    var sun_light = globals.sun_color.rgb * globals.sun_dir.w * ndotl;
     
-    // View-dependent specular (Wet/Shiny look)
-    // Only apply if the surface is receiving significant light
-    var specular = vec3f(0.0);
-    let light_intensity = max(voxel_light.r, max(voxel_light.g, voxel_light.b));
-    
+    if ndotl > 0.0 {
+        // Hard shadows for sunlight
+        let shadow_origin = hit.pos + hit.normal * 0.05;
+        let sun_vis = trace_visibility(shadow_origin, -globals.sun_dir.xyz, globals.sun_shadow_max);
+        sun_light *= sun_vis;
+    }
+
+    // Total Irradiance = Direct + Indirect (occluded)
+    let total_light = sun_light + voxel_light * ao;
+
     // Procedural Bump Mapping
     let noise_scale = 150.0;
     let bump_intensity = 0.08;
@@ -317,32 +410,36 @@ fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
     let perturbation = random_vec * noise_strength * bump_intensity;
     let n = normalize(hit.normal + perturbation);
 
-    // Use extracted properties for specular logic
-    if (light_intensity > 0.05) {
+    // View-dependent specular
+    var specular = vec3f(0.0);
+    // Calculate specular only if there is light
+    let light_intensity = max(total_light.r, max(total_light.g, total_light.b));
+
+    if (light_intensity > 0.0001) {
         let v = -dir;
-        
         let view_dot_n = max(dot(v, n), 0.0);
 
-        // F0: Surface reflection at 0 degrees
         let f0 = mix(vec3f(0.04), noisy_albedo, metallic);
-
-        // Calculate Dampened F90: Reduce grazing angle reflection based on roughness
         let f90 = max(vec3f(1.0 - roughness), f0);
-
-        // Modified Fresnel Schlick with dampened F90
         let fresnel = f0 + (f90 - f0) * pow(1.0 - view_dot_n, 5.0);
-        
-        // Final Specular Attenuation (The "Matte Hammer")
-        // Multiply by inverse roughness to ensure rough materials are truly matte.
-        specular = fresnel * voxel_light * (1.0 - roughness);
+
+        // Specular is added on top
+        specular = fresnel * total_light * (1.0 - roughness);
+
+        // Mask specular on very rough surfaces
+        if (roughness > 0.9) {
+            specular = vec3f(0.0);
+        }
     }
 
-    // Final Color Composition
     let diffuse = noisy_albedo * (1.0 - metallic);
-    
-    let final_color = diffuse * voxel_light * ao + emit + specular;
 
-    return final_color;
+    // Final composition
+    // (Diffuse * Light + Specular) + Emission
+    // Emission is added at the end for visual glow of the surface itself.
+    var final_hdr = (diffuse * total_light + specular) + emit;
+    
+    return final_hdr;
 }
 
 fn sky(dir: vec3f) -> vec3f {
@@ -383,7 +480,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
 
     var color: vec3f;
     if hit.hit {
-        color = shade_pbr(hit, dir);
+        color = shade_pbr(hit, dir, in.position.xy);
     } else {
         color = sky(dir);
     }

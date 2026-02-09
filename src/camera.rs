@@ -128,6 +128,13 @@ impl FpsCamera {
         self.view_matrix = Self::create_view(self.position, self.yaw, self.pitch);
     }
 
+    /// Unit forward vector derived from yaw and pitch.
+    pub fn forward(&self) -> Vec3 {
+        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
+        let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
+        Vec3::new(sin_yaw * cos_pitch, sin_pitch, -cos_yaw * cos_pitch)
+    }
+
     /// Update aspect ratio (call on window resize).
     pub fn set_aspect_ratio(&mut self, aspect_ratio: f32) {
         self.proj_matrix = Self::create_projection(aspect_ratio);

@@ -27,12 +27,8 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     // Additive blending
     var result = scene_color + bloom_color * pc.bloom_intensity;
     
-    // Tone mapping (Reinhard) 
-    // We moved this from the main raytracer to here
+    // Tone mapping (exposure + Reinhard)
     result = vec3f(1.0) - exp(-result * pc.exposure);
-    
-    // Gamma correction
-    result = pow(result, vec3f(1.0 / 2.2));
-    
+
     return vec4f(result, 1.0);
 }

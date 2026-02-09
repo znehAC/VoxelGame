@@ -89,6 +89,11 @@ impl BlockRegistry {
         self.name_to_id.get(name).copied()
     }
 
+    /// Look up the display name for a block by its sequential index.
+    pub fn get_block_name(&self, index: u16) -> Option<&str> {
+        self.blocks.get(index as usize).map(|b| b.name.as_str())
+    }
+
     /// Total number of registered blocks (including Air).
     pub fn block_count(&self) -> u16 {
         self.blocks.len() as u16
@@ -206,6 +211,17 @@ emission = 1.0
         assert_eq!(reg.get_id("game:dirt"), Some(2));
         assert_eq!(reg.get_id("game:lava"), Some(3));
         assert_eq!(reg.get_id("game:missing"), None);
+    }
+
+    #[test]
+    fn block_name_lookup() {
+        let mut reg = BlockRegistry::new();
+        reg.load_from_string(TEST_TOML).unwrap();
+        assert_eq!(reg.get_block_name(0), Some("Air"));
+        assert_eq!(reg.get_block_name(1), Some("Stone"));
+        assert_eq!(reg.get_block_name(2), Some("Dirt"));
+        assert_eq!(reg.get_block_name(3), Some("Lava"));
+        assert_eq!(reg.get_block_name(99), None);
     }
 
     #[test]

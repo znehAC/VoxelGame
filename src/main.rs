@@ -13,12 +13,14 @@ use std::time::Instant;
 use log::{debug, error, info};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use ara_core::{Action, GlobalUniforms, InputManager, PackedVoxel, GRID_SIZE};
+use ara_core::{
+    dda_raycast, Action, BlockRegistry, GlobalUniforms, InputManager, PackedVoxel, GRID_SIZE,
+};
 use camera::FpsCamera;
 use gpu::GpuContext;
 use renderer::Renderer;
@@ -101,6 +103,7 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
     renderer: Option<Renderer>,
+    registry: Option<BlockRegistry>,
     camera: FpsCamera,
     input: InputManager,
     last_frame_time: Option<Instant>,
@@ -108,6 +111,8 @@ struct App {
     frame_count: u32,
     fps_update_time: Instant,
     voxels: Vec<PackedVoxel>,
+    selected_material: u16,
+    target_block_name: Option<String>,
 }
 
 impl App {
@@ -116,6 +121,7 @@ impl App {
             window: None,
             gpu: None,
             renderer: None,
+            registry: None,
             camera: FpsCamera::new(INITIAL_WIDTH as f32 / INITIAL_HEIGHT as f32),
             input: default_input_bindings(),
             last_frame_time: None,
@@ -123,6 +129,8 @@ impl App {
             frame_count: 0,
             fps_update_time: Instant::now(),
             voxels: Vec::new(),
+            selected_material: 1,
+            target_block_name: None,
         }
     }
 
@@ -181,8 +189,8 @@ impl ApplicationHandler for App {
         info!("Loaded {} block types", registry.block_count());
 
         let test_voxels = generate_room_scene();
-        // Store initial voxels in app state
         self.voxels = test_voxels.clone();
+        self.registry = Some(registry);
 
         let size = window.inner_size();
         let renderer = Renderer::new(
@@ -235,6 +243,7 @@ impl ApplicationHandler for App {
                             Ok(registry) => {
                                 let palette = registry.generate_texture_data();
                                 renderer.reload_palette(gpu, &palette);
+                                self.registry = Some(registry);
                                 println!("Assets reloaded successfully.");
                             }
                             Err(e) => eprintln!("Failed to reload assets: {e}"),
@@ -250,9 +259,49 @@ impl ApplicationHandler for App {
             }
             WindowEvent::MouseInput {
                 state: ElementState::Pressed,
+                button,
                 ..
             } => {
-                self.grab_cursor();
+                if !self.input.cursor_grabbed {
+                    self.grab_cursor();
+                    return;
+                }
+
+                let dir = self.camera.forward();
+                if let Some(hit) = dda_raycast(&self.voxels, self.camera.position, dir, 64.0) {
+                    if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
+                        match button {
+                            MouseButton::Left => {
+                                self.voxels[hit.index] = PackedVoxel::AIR;
+                                renderer.update_voxel_at(gpu, hit.index, PackedVoxel::AIR);
+                            }
+                            MouseButton::Right => {
+                                let gs = GRID_SIZE as i32;
+                                let neighbor = hit.grid_pos + hit.normal;
+                                if neighbor.x >= 0
+                                    && neighbor.x < gs
+                                    && neighbor.y >= 0
+                                    && neighbor.y < gs
+                                    && neighbor.z >= 0
+                                    && neighbor.z < gs
+                                {
+                                    let idx = (neighbor.z * gs * gs
+                                        + neighbor.y * gs
+                                        + neighbor.x)
+                                        as usize;
+                                    // Prevent placing inside the camera
+                                    let cam_cell = self.camera.position.floor().as_ivec3();
+                                    if neighbor != cam_cell {
+                                        let voxel = PackedVoxel::new(self.selected_material);
+                                        self.voxels[idx] = voxel;
+                                        renderer.update_voxel_at(gpu, idx, voxel);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
             WindowEvent::Focused(false) => {
                 self.release_cursor();
@@ -277,42 +326,48 @@ impl ApplicationHandler for App {
 
                 self.camera.update(&mut self.input, dt);
 
+                // Debug HUD: raycast to find targeted block name
+                self.target_block_name = {
+                    let dir = self.camera.forward();
+                    dda_raycast(&self.voxels, self.camera.position, dir, 64.0).and_then(|hit| {
+                        let voxel = self.voxels[hit.index];
+                        self.registry
+                            .as_ref()
+                            .and_then(|reg| reg.get_block_name(voxel.id()))
+                            .map(|s| s.to_owned())
+                    })
+                };
+
                 if let (Some(gpu), Some(renderer), Some(window)) =
                     (&self.gpu, &mut self.renderer, &self.window)
                 {
                     let time = self.start_time.elapsed().as_secs_f32();
-                    
-                    // Simple animation: Moving Lava Block
-                    // Clear previous lava pos (if tracked), but for now just recalculate scene or specific index
-                    // Optimization: We know the scene is static except for the lava.
-                    
+                    let gs = GRID_SIZE as usize;
+
+                    // Animated lava orb — partial writes only
                     let radius = 15.0;
                     let center_x = 32.0;
                     let center_z = 32.0;
-                    let y = 25; // Floating in mid-air
-                    
-                    // Previous position (approx)
-                    let prev_time = time - dt;
-                    let prev_angle = prev_time * 1.0; // speed 1.0 rad/s
+                    let y = 25usize;
+
+                    let prev_angle = (time - dt) * 1.0;
                     let prev_x = (center_x + radius * prev_angle.cos()) as usize;
                     let prev_z = (center_z + radius * prev_angle.sin()) as usize;
-                    
-                    if prev_x < GRID_SIZE as usize && prev_z < GRID_SIZE as usize {
-                         let idx = prev_z * GRID_SIZE as usize * GRID_SIZE as usize + y * GRID_SIZE as usize + prev_x;
-                         self.voxels[idx] = PackedVoxel::AIR;
+
+                    if prev_x < gs && prev_z < gs {
+                        let idx = prev_z * gs * gs + y * gs + prev_x;
+                        self.voxels[idx] = PackedVoxel::AIR;
+                        renderer.update_voxel_at(gpu, idx, PackedVoxel::AIR);
                     }
 
-                    // New position
                     let angle = time * 1.0;
                     let curr_x = (center_x + radius * angle.cos()) as usize;
                     let curr_z = (center_z + radius * angle.sin()) as usize;
 
-                    if curr_x < GRID_SIZE as usize && curr_z < GRID_SIZE as usize {
-                        let idx = curr_z * GRID_SIZE as usize * GRID_SIZE as usize + y * GRID_SIZE as usize + curr_x;
-                        self.voxels[idx] = PackedVoxel::new(8); // Lava
-                        
-                        // Also update renderer
-                        renderer.update_voxels(gpu, &self.voxels);
+                    if curr_x < gs && curr_z < gs {
+                        let idx = curr_z * gs * gs + y * gs + curr_x;
+                        self.voxels[idx] = PackedVoxel::new(8);
+                        renderer.update_voxel_at(gpu, idx, PackedVoxel::new(8));
                     }
 
                     let size = window.inner_size();
@@ -322,6 +377,13 @@ impl ApplicationHandler for App {
                         self.camera.position.into(),
                         time,
                         [size.width as f32, size.height as f32],
+                        [0.4, -0.7, 0.3],
+                        2.0,
+                        [1.0, 0.95, 0.85],
+                        [0.4, 0.6, 0.9],
+                        0.15,
+                        [0.15, 0.1, 0.05],
+                        128.0,
                     );
 
                     match renderer.render(gpu, &uniforms) {
@@ -342,15 +404,19 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                // FPS counter in window title
+                // FPS counter + target block in window title
                 self.frame_count += 1;
                 let elapsed = self.fps_update_time.elapsed().as_secs_f32();
                 if elapsed >= 1.0 {
                     let fps = self.frame_count as f32 / elapsed;
                     let frame_ms = elapsed * 1000.0 / self.frame_count as f32;
+                    let block_label = self
+                        .target_block_name
+                        .as_deref()
+                        .unwrap_or("---");
                     if let Some(window) = &self.window {
                         window.set_title(&format!(
-                            "{WINDOW_TITLE} | {fps:.0} FPS ({frame_ms:.1} ms)"
+                            "{WINDOW_TITLE} | {block_label} | {fps:.0} FPS ({frame_ms:.1} ms)"
                         ));
                     }
                     self.frame_count = 0;

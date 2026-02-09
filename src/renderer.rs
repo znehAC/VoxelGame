@@ -7,10 +7,6 @@ use crate::gpu::GpuContext;
 use crate::light::LightPropagation;
 use crate::postprocess::BloomPipeline;
 
-/// Fallback shader used if asset loading fails at startup.
-
-// Fallback shader removed.
-
 /// Manages surface presentation with palette-texture + voxel-SSBO pipeline.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -221,7 +217,7 @@ impl Renderer {
         });
 
         // Light propagation system
-        let light = LightPropagation::new(gpu, &voxel_buf, &palette_tex, 15);
+        let light = LightPropagation::new(gpu, &voxel_buf, &palette_tex, 25);
 
         // Load shader from assets, panic if file not found (no fallback)
         let shader_src = assets::load_shader().expect("Failed to load voxel_raytracer.wgsl");
@@ -403,5 +399,12 @@ impl Renderer {
     pub fn update_voxels(&self, gpu: &GpuContext, voxel_data: &[PackedVoxel]) {
         let voxel_bytes = bytemuck::cast_slice::<PackedVoxel, u8>(voxel_data);
         gpu.queue().write_buffer(&self.voxel_buf, 0, voxel_bytes);
+    }
+
+    /// Write a single voxel to the GPU buffer at the given linear index.
+    pub fn update_voxel_at(&self, gpu: &GpuContext, index: usize, voxel: PackedVoxel) {
+        let offset = (index * std::mem::size_of::<PackedVoxel>()) as u64;
+        gpu.queue()
+            .write_buffer(&self.voxel_buf, offset, bytemuck::bytes_of(&voxel));
     }
 }
