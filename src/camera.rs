@@ -4,7 +4,7 @@
 //! Vulkan's Y-flip is handled in the projection matrix.
 
 use ara_core::glam::{Mat4, Vec3};
-use ara_core::{Action, InputManager, InputState};
+use ara_core::{Action, InputManager};
 
 /// Movement speed in units per second.
 const MOVE_SPEED: f32 = 10.0;
@@ -34,7 +34,7 @@ pub struct FpsCamera {
 impl FpsCamera {
     /// Create a new camera at the origin facing -Z.
     pub fn new(aspect_ratio: f32) -> Self {
-        let position = Vec3::new(32.0, 55.0, 10.0); // Start above ground
+        let position = Vec3::new(32.0, 62.0, 10.0); // Start above ground
         let yaw = 0.0;
         let pitch = -0.3; // Looking slightly down
 
@@ -133,20 +133,7 @@ impl FpsCamera {
         self.proj_matrix = Self::create_projection(aspect_ratio);
     }
 
-    /// Get the view matrix.
-    pub fn view_matrix(&self) -> Mat4 {
-        self.view_matrix
-    }
 
-    /// Get the projection matrix.
-    pub fn proj_matrix(&self) -> Mat4 {
-        self.proj_matrix
-    }
-
-    /// Get the inverse view-projection matrix (for ray reconstruction).
-    pub fn inv_view_proj(&self) -> Mat4 {
-        (self.proj_matrix * self.view_matrix).inverse()
-    }
 
     /// Get the inverse view matrix (Camera -> World transform).
     pub fn view_inverse(&self) -> Mat4 {
@@ -158,20 +145,5 @@ impl FpsCamera {
         self.proj_matrix.inverse()
     }
 
-    /// Get the forward direction vector.
-    pub fn forward(&self) -> Vec3 {
-        let (sin_yaw, cos_yaw) = self.yaw.sin_cos();
-        let (sin_pitch, cos_pitch) = self.pitch.sin_cos();
-        Vec3::new(sin_yaw * cos_pitch, sin_pitch, -cos_yaw * cos_pitch)
-    }
 
-    /// Generate InputState for shader consumption.
-    pub fn input_state(&self) -> InputState {
-        let forward = self.forward();
-        InputState::new(
-            self.position.into(),
-            forward.into(),
-            self.inv_view_proj().to_cols_array_2d(),
-        )
-    }
 }

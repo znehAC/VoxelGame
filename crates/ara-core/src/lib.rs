@@ -21,3 +21,9 @@ pub type VoxelId = u16;
 
 /// Air voxel (empty space).
 pub const VOXEL_AIR: VoxelId = 0;
+
+/// Grid size (cubic).
+pub const GRID_SIZE: u32 = 64;
+
+/// Max raymarching steps.
+pub const MAX_STEPS: u32 = 256;

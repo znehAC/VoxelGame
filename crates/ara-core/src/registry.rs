@@ -4,19 +4,27 @@ use std::collections::HashMap;
 
 use serde::Deserialize;
 
+
+fn default_roughness() -> f32 {
+    0.9
+}
+fn default_metallic() -> f32 {
+    0.0 
+}
+
 /// Block definition loaded from TOML.
 #[derive(Deserialize, Clone, Debug)]
 pub struct BlockDef {
     pub id: String,
     pub name: String,
     pub color: String,
-    #[serde(default)]
+    #[serde(default = "default_roughness")]
     pub roughness: f32,
     #[serde(default)]
     pub emission: f32,
     #[serde(default)]
     pub noise: f32,
-    #[serde(default)]
+    #[serde(default = "default_metallic")]
     pub metallic: f32,
 }
 
@@ -33,6 +41,7 @@ pub struct BlockRegistry {
     blocks: Vec<BlockDef>,
     name_to_id: HashMap<String, u16>,
 }
+
 
 impl BlockRegistry {
     /// Create an empty registry with Air at index 0.

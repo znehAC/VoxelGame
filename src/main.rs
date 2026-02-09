@@ -3,6 +3,8 @@
 mod assets;
 mod camera;
 mod gpu;
+mod light;
+mod postprocess;
 mod renderer;
 
 use std::sync::Arc;
@@ -16,7 +18,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use ara_core::{Action, GlobalUniforms, InputManager, PackedVoxel};
+use ara_core::{Action, GlobalUniforms, InputManager, PackedVoxel, GRID_SIZE};
 use camera::FpsCamera;
 use gpu::GpuContext;
 use renderer::Renderer;
@@ -40,31 +42,56 @@ fn default_input_bindings() -> InputManager {
 }
 
 /// Generate a 64x64x64 test voxel volume: checkerboard ground + lava pool.
-fn generate_test_voxels() -> Vec<PackedVoxel> {
-    let size = 64;
+/// Generate a 64x64x64 room scene with walls and a moving lava block.
+fn generate_room_scene() -> Vec<PackedVoxel> {
+    let size = GRID_SIZE as usize;
     let mut voxels = vec![PackedVoxel::AIR; size * size * size];
+
+    let ground_y = 10;
+    let ceiling_y = 50;
+    let min_xz = 10;
+    let max_xz = 53;
 
     for z in 0..size {
         for x in 0..size {
-            // Stone sub-surface: y=61..63
-            for y in 61..63 {
+            for y in 0..size {
                 let idx = z * size * size + y * size + x;
-                voxels[idx] = PackedVoxel::new(1);
-            }
+                
+                // Floor (Checkerboard)
+                if y == ground_y && x >= min_xz && x <= max_xz && z >= min_xz && z <= max_xz {
+                     // Stone (1) / Grass (3) checkerboard
+                    let mat = if (x + z) % 2 == 0 { 1u16 } else { 3u16 };
+                    voxels[idx] = PackedVoxel::new(mat);
+                    continue;
+                }
 
-            // Ground surface at y=63: checkerboard stone/grass
-            let ground = if (x + z) % 2 == 0 { 1u16 } else { 3u16 };
-            let idx = z * size * size + 63 * size + x;
-            voxels[idx] = PackedVoxel::new(ground);
+                // Ceiling (Wood)
+                if y == ceiling_y && x >= min_xz && x <= max_xz && z >= min_xz && z <= max_xz {
+                    voxels[idx] = PackedVoxel::new(6); // Wood
+                    continue;
+                }
+
+                // Walls (Stone)
+                if y > ground_y && y < ceiling_y {
+                    let is_wall_x = x == min_xz || x == max_xz;
+                    let is_wall_z = z == min_xz || z == max_xz;
+                    
+                    if (is_wall_x && z >= min_xz && z <= max_xz) || (is_wall_z && x >= min_xz && x <= max_xz) {
+                        voxels[idx] = PackedVoxel::new(1); // Stone
+                        continue;
+                    }
+                }
+            }
         }
     }
-
-    // Lava pool in center at y=63
-    for z in 28..36 {
-        for x in 28..36 {
-            let idx = z * size * size + 63 * size + x;
-            voxels[idx] = PackedVoxel::new(8);
-        }
+    
+    // Add some random pillars inside
+    for y in ground_y+1..ground_y+5 {
+        let idx1 = 20 * size * size + y * size + 20;
+        voxels[idx1] = PackedVoxel::new(2); // Dirt
+        
+        let idx2 = 40 * size * size + y * size + 40;
+        voxels[idx2] = PackedVoxel::new(2); // Dirt
     }
 
     voxels
@@ -80,6 +107,7 @@ struct App {
     start_time: Instant,
     frame_count: u32,
     fps_update_time: Instant,
+    voxels: Vec<PackedVoxel>,
 }
 
 impl App {
@@ -94,6 +122,7 @@ impl App {
             start_time: Instant::now(),
             frame_count: 0,
             fps_update_time: Instant::now(),
+            voxels: Vec::new(),
         }
     }
 
@@ -151,7 +180,9 @@ impl ApplicationHandler for App {
         let palette_data = registry.generate_texture_data();
         info!("Loaded {} block types", registry.block_count());
 
-        let test_voxels = generate_test_voxels();
+        let test_voxels = generate_room_scene();
+        // Store initial voxels in app state
+        self.voxels = test_voxels.clone();
 
         let size = window.inner_size();
         let renderer = Renderer::new(
@@ -247,9 +278,43 @@ impl ApplicationHandler for App {
                 self.camera.update(&mut self.input, dt);
 
                 if let (Some(gpu), Some(renderer), Some(window)) =
-                    (&self.gpu, &self.renderer, &self.window)
+                    (&self.gpu, &mut self.renderer, &self.window)
                 {
                     let time = self.start_time.elapsed().as_secs_f32();
+                    
+                    // Simple animation: Moving Lava Block
+                    // Clear previous lava pos (if tracked), but for now just recalculate scene or specific index
+                    // Optimization: We know the scene is static except for the lava.
+                    
+                    let radius = 15.0;
+                    let center_x = 32.0;
+                    let center_z = 32.0;
+                    let y = 25; // Floating in mid-air
+                    
+                    // Previous position (approx)
+                    let prev_time = time - dt;
+                    let prev_angle = prev_time * 1.0; // speed 1.0 rad/s
+                    let prev_x = (center_x + radius * prev_angle.cos()) as usize;
+                    let prev_z = (center_z + radius * prev_angle.sin()) as usize;
+                    
+                    if prev_x < GRID_SIZE as usize && prev_z < GRID_SIZE as usize {
+                         let idx = prev_z * GRID_SIZE as usize * GRID_SIZE as usize + y * GRID_SIZE as usize + prev_x;
+                         self.voxels[idx] = PackedVoxel::AIR;
+                    }
+
+                    // New position
+                    let angle = time * 1.0;
+                    let curr_x = (center_x + radius * angle.cos()) as usize;
+                    let curr_z = (center_z + radius * angle.sin()) as usize;
+
+                    if curr_x < GRID_SIZE as usize && curr_z < GRID_SIZE as usize {
+                        let idx = curr_z * GRID_SIZE as usize * GRID_SIZE as usize + y * GRID_SIZE as usize + curr_x;
+                        self.voxels[idx] = PackedVoxel::new(8); // Lava
+                        
+                        // Also update renderer
+                        renderer.update_voxels(gpu, &self.voxels);
+                    }
+
                     let size = window.inner_size();
                     let uniforms = GlobalUniforms::new(
                         self.camera.view_inverse().to_cols_array_2d(),

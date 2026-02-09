@@ -23,12 +23,14 @@ struct HitResult {
 
 const GRID_SIZE: u32 = 64u;
 const MAX_STEPS: u32 = 256u;
-const SUN_DIR: vec3f = vec3f(0.318, -0.557, 0.239); // normalized(0.4, -0.7, 0.3)
 
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 @group(0) @binding(2) var t_palette: texture_2d_array<f32>;
 @group(0) @binding(3) var s_palette: sampler;
 @group(0) @binding(4) var<storage, read> voxels: array<u32>;
+
+@group(1) @binding(0) var t_light: texture_3d<f32>;
+@group(1) @binding(1) var s_light: sampler;
 
 fn unpack_voxel(packed: u32) -> VoxelData {
     return VoxelData(
@@ -40,6 +42,75 @@ fn unpack_voxel(packed: u32) -> VoxelData {
 
 fn voxel_index(x: i32, y: i32, z: i32) -> u32 {
     return u32(z) * GRID_SIZE * GRID_SIZE + u32(y) * GRID_SIZE + u32(x);
+}
+
+fn get_voxel_at(pos: vec3i) -> bool {
+    if (pos.x < 0 || pos.x >= i32(GRID_SIZE) ||
+        pos.y < 0 || pos.y >= i32(GRID_SIZE) ||
+        pos.z < 0 || pos.z >= i32(GRID_SIZE)) {
+        return false;
+    }
+    let idx = voxel_index(pos.x, pos.y, pos.z);
+    let packed = voxels[idx];
+    return (packed & 0xFFFFu) != 0u;
+}
+
+fn get_ao(pos: vec3f, normal: vec3f) -> f32 {
+    let p = vec3i(floor(pos + normal * 0.5));
+    
+    // We want to sample the 4 neighbors around the vertex on the face
+    // But since we are raymarching, we have a hit position which is anywhere on the face.
+    // A simple AO valid for blocks is to check the 4 diagonal neighbors responsible for occlusion on that face.
+
+    // Let's create a basis.
+    var u = vec3f(0.0);
+    var v = vec3f(0.0);
+
+    if (abs(normal.x) > 0.5) {
+        u = vec3f(0.0, 1.0, 0.0);
+        v = vec3f(0.0, 0.0, 1.0);
+    } else if (abs(normal.y) > 0.5) {
+        u = vec3f(1.0, 0.0, 0.0);
+        v = vec3f(0.0, 0.0, 1.0);
+    } else {
+        u = vec3f(1.0, 0.0, 0.0);
+        v = vec3f(0.0, 1.0, 0.0);
+    }
+
+    // Determine uv coordinates on the face (0..1)
+    let rel = pos - (vec3f(p) + vec3f(0.5));
+    let uv = vec2f(dot(rel, u), dot(rel, v)) + 0.5; // 0..1
+
+    // Neighbor offsets
+    let off_u = vec3i(u);
+    let off_v = vec3i(v);
+
+    // Check 4 corners (neighbors)
+    //  3 -- 2
+    //  |    |
+    //  0 -- 1
+    
+    // Neighbors in the plane perpendicular to normal
+    let n0 = get_voxel_at(p - off_u - off_v);
+    let n1 = get_voxel_at(p + off_u - off_v);
+    let n2 = get_voxel_at(p + off_u + off_v);
+    let n3 = get_voxel_at(p - off_u + off_v);
+
+    // 0 means occluded, 1 means clear.
+    let occ0 = select(1.0, 0.0, n0);
+    let occ1 = select(1.0, 0.0, n1);
+    let occ2 = select(1.0, 0.0, n2);
+    let occ3 = select(1.0, 0.0, n3);
+
+    // Bilinear interpolation
+    let ao = mix(
+        mix(occ0, occ1, uv.x),
+        mix(occ3, occ2, uv.x),
+        uv.y
+    );
+    
+    // Curve it for strength
+    return smoothstep(0.0, 1.0, ao * 0.5 + 0.5);
 }
 
 fn ray_aabb(origin: vec3f, inv_dir: vec3f, box_min: vec3f, box_max: vec3f) -> vec2f {
@@ -90,8 +161,34 @@ fn dda_march(origin: vec3f, dir: vec3f) -> HitResult {
     if (packed & 0xFFFFu) != 0u {
         result.hit = true;
         result.pos = entry;
-        result.normal = -vec3f(f32(step.x), f32(step.y), f32(step.z));
-        result.normal = normalize(result.normal);
+
+        // Determine axis-aligned entry face normal from AABB intersection
+        var n = vec3f(0.0);
+        if bounds.x > 0.0 {
+            // Ray entered grid from outside: use AABB entry face
+            let t0 = -origin * inv_dir;
+            let t1 = (vec3f(f32(GRID_SIZE)) - origin) * inv_dir;
+            let tmin = min(t0, t1);
+            if tmin.x >= tmin.y && tmin.x >= tmin.z {
+                n.x = -f32(step.x);
+            } else if tmin.y >= tmin.x && tmin.y >= tmin.z {
+                n.y = -f32(step.y);
+            } else {
+                n.z = -f32(step.z);
+            }
+        } else {
+            // Camera inside solid voxel: use dominant ray axis
+            let a = abs(dir);
+            if a.x >= a.y && a.x >= a.z {
+                n.x = -f32(step.x);
+            } else if a.y >= a.x && a.y >= a.z {
+                n.y = -f32(step.y);
+            } else {
+                n.z = -f32(step.z);
+            }
+        }
+        result.normal = n;
+
         result.voxel = unpack_voxel(packed);
         return result;
     }
@@ -154,6 +251,18 @@ fn dda_march(origin: vec3f, dir: vec3f) -> HitResult {
     return result;
 }
 
+fn hash(p: vec3f) -> f32 {
+    var p3 = fract(p * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn hash33(p: vec3f) -> vec3f {
+    var p3 = fract(p * vec3f(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yxz + 33.33);
+    return fract((p3.xxy + p3.yzz) * p3.zyx);
+}
+
 fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
     let pu = hit.voxel.id % 256u;
     let pv = hit.voxel.id / 256u;
@@ -163,69 +272,105 @@ fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
     let albedo = textureLoad(t_palette, coords, 0, 0).rgb;
 
     // Palette layer 1: material properties
-    // Hardware decodes sRGB→linear, but these values are linear data stored in sRGB texture.
-    // Undo the hardware conversion: apply sRGB encoding (pow 1/2.2) to recover original values.
-    let props_raw = textureLoad(t_palette, coords, 1, 0);
-    let props = pow(props_raw, vec4f(1.0 / 2.2));
-    let roughness = props.r;
-    let emission = props.g;
-    let metallic = props.a;
-
-    let n = hit.normal;
-    let l = normalize(-SUN_DIR); // toward the light
-    let v = -dir;               // toward the viewer
-    let h = normalize(l + v);
-
-    let n_dot_l = max(dot(n, l), 0.0);
-    let n_dot_h = max(dot(n, h), 0.0);
-
-    let light_color = vec3f(1.3, 1.2, 1.0);
-
-    // Diffuse: Lambertian
-    let diffuse = albedo * n_dot_l * light_color;
-
-    // Specular: Blinn-Phong with roughness-derived shininess
-    let shininess = max(2.0 / (roughness * roughness + 0.001) - 2.0, 1.0);
-    let spec_strength = pow(n_dot_h, shininess);
-    // F0: blend between dielectric (0.04) and albedo based on metallic
-    let f0 = mix(vec3f(0.04), albedo, metallic);
-    let specular = f0 * spec_strength * n_dot_l * light_color;
-
-    // Ambient: bluish sky-fill
-    let ambient = albedo * vec3f(0.15, 0.17, 0.25);
+    // R=Roughness, G=Emission, B=Noise, A=Metallic (packed as u8 unorm)
+    let data = textureLoad(t_palette, coords, 1, 0);
+    let roughness = data.r;
+    let emission = data.g;
+    let noise_strength = data.b;
+    let metallic = data.a;
 
     // Emission: lava glow
-    let emit = albedo * emission * 4.0;
+    // Scale up emission to make it bloom
+    let emit = albedo * emission * 10.0;
 
-    let color = diffuse + specular + ambient + emit;
+    // Apply Noise Variation to Albedo
+    // Use the voxel integer coordinate to seed the hash for variation.
+    let voxel_pos = floor(hit.pos - dir * 0.001);
+    let noise_val = hash(voxel_pos);
+    
+    // Modulate albedo based on noise strength (e.g. stone has high variation).
+    let noise_mod = 1.0 - (noise_strength * noise_val * 0.5);
+    let noisy_albedo = albedo * noise_mod;
 
-    // Reinhard tone mapping
-    return color / (color + vec3f(1.0));
+    // Sample Light from Voxel Grid
+    // Offset slightly along normal to sample the "air" block next to the surface
+    let light_uvw = (hit.pos + hit.normal * 0.5) / vec3f(f32(GRID_SIZE));
+    
+    // Sample Level 0 to avoid mipmap issues with manual gradient
+    let voxel_light = textureSampleLevel(t_light, s_light, light_uvw, 0.0).rgb;
+
+    // Calculate AO
+    let ao = get_ao(hit.pos, hit.normal);
+
+    // Pure Voxel Lighting Model
+    // No analytical sun. The "sun" is just bright voxels in the light texture.
+    
+    // View-dependent specular (Wet/Shiny look)
+    // Only apply if the surface is receiving significant light
+    var specular = vec3f(0.0);
+    let light_intensity = max(voxel_light.r, max(voxel_light.g, voxel_light.b));
+    
+    // Procedural Bump Mapping
+    let noise_scale = 150.0;
+    let bump_intensity = 0.08;
+    let random_vec = hash33(hit.pos * noise_scale) * 2.0 - 1.0;
+    let perturbation = random_vec * noise_strength * bump_intensity;
+    let n = normalize(hit.normal + perturbation);
+
+    // Use extracted properties for specular logic
+    if (light_intensity > 0.05) {
+        let v = -dir;
+        
+        let view_dot_n = max(dot(v, n), 0.0);
+
+        // F0: Surface reflection at 0 degrees
+        let f0 = mix(vec3f(0.04), noisy_albedo, metallic);
+
+        // Calculate Dampened F90: Reduce grazing angle reflection based on roughness
+        let f90 = max(vec3f(1.0 - roughness), f0);
+
+        // Modified Fresnel Schlick with dampened F90
+        let fresnel = f0 + (f90 - f0) * pow(1.0 - view_dot_n, 5.0);
+        
+        // Final Specular Attenuation (The "Matte Hammer")
+        // Multiply by inverse roughness to ensure rough materials are truly matte.
+        specular = fresnel * voxel_light * (1.0 - roughness);
+    }
+
+    // Final Color Composition
+    let diffuse = noisy_albedo * (1.0 - metallic);
+    
+    let final_color = diffuse * voxel_light * ao + emit + specular;
+
+    return final_color;
 }
 
 fn sky(dir: vec3f) -> vec3f {
-    // Y-down: -dir.y is up
-    let t = clamp(-dir.y, 0.0, 1.0);
-    let horizon = vec3f(0.7, 0.75, 0.85);
-    let zenith = vec3f(0.25, 0.45, 0.9);
-    return mix(horizon, zenith, t);
+    // Y-up: positive dir.y is towards zenith
+    return vec3f(0.0);
+}
+
+struct VertexOutput {
+    @builtin(position) position: vec4f,
+    @location(0) ndc: vec2f,
 }
 
 @vertex
-fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
+fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
+    var out: VertexOutput;
     let x = f32(i32(vi) / 2) * 4.0 - 1.0;
     let y = f32(i32(vi) % 2) * 4.0 - 1.0;
-    return vec4f(x, y, 0.0, 1.0);
+    out.position = vec4f(x, y, 0.0, 1.0);
+    // WGPU uses Y-up NDC (-1 bottom, +1 top).
+    // Our projection matrix is optimized for Vulkan Y-down (-1 top, +1 bottom).
+    out.ndc = vec2f(x, -y);
+    return out;
 }
 
 @fragment
-fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
-    // Pixel → NDC
-    let ndc_x = (frag_coord.x / globals.resolution_x) * 2.0 - 1.0;
-    let ndc_y = (frag_coord.y / globals.resolution_y) * 2.0 - 1.0;
-
+fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     // NDC → clip → camera space via inverse projection
-    let clip = vec4f(ndc_x, ndc_y, 1.0, 1.0);
+    let clip = vec4f(in.ndc.x, in.ndc.y, 1.0, 1.0);
     let cam_space = globals.proj_inverse * clip;
     let cam_dir = normalize(cam_space.xyz / cam_space.w);
 
