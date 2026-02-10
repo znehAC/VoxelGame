@@ -1,11 +1,12 @@
 //! Presentation layer: fullscreen-quad pipeline with palette texture, voxel SSBO, and uniforms.
 
-use ara_core::{bytemuck, GlobalUniforms, PackedVoxel};
+use ara_core::{bytemuck, GlobalUniforms, LightBuffer, PackedVoxel, PointLight};
 
 use crate::assets;
 use crate::gpu::GpuContext;
 use crate::light::LightPropagation;
 use crate::postprocess::BloomPipeline;
+use crate::ui::{UiContext, UiSystem};
 
 /// Manages surface presentation with palette-texture + voxel-SSBO pipeline.
 pub struct Renderer {
@@ -14,10 +15,12 @@ pub struct Renderer {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_buf: wgpu::Buffer,
+    light_buf: wgpu::Buffer,
     voxel_buf: wgpu::Buffer,
     palette_tex: wgpu::Texture,
     light: LightPropagation,
     post_process: BloomPipeline,
+    ui_system: UiSystem,
 }
 
 impl Renderer {
@@ -52,6 +55,9 @@ impl Renderer {
 
         // Initialize Bloom Pipeline
         let post_process = BloomPipeline::new(gpu, width, height, format);
+
+        // Initialize UI System
+        let ui_system = UiSystem::new(gpu, format);
 
         // Palette texture: 256x256, 2 layers, Rgba8UnormSrgb
         let palette_tex = gpu.device().create_texture(&wgpu::TextureDescriptor {
@@ -144,6 +150,14 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        // Light uniform buffer
+        let light_buf = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ara Light Uniforms"),
+            size: std::mem::size_of::<LightBuffer>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         // Bind group layout
         let bind_group_layout =
             gpu.device()
@@ -190,6 +204,17 @@ impl Renderer {
                             },
                             count: None,
                         },
+                        // binding 5: point light buffer
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 5,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
 
@@ -213,11 +238,15 @@ impl Renderer {
                     binding: 4,
                     resource: voxel_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: light_buf.as_entire_binding(),
+                },
             ],
         });
 
         // Light propagation system
-        let light = LightPropagation::new(gpu, &voxel_buf, &palette_tex, 25);
+        let light = LightPropagation::new(gpu, &voxel_buf, &uniform_buf, &palette_tex, 25);
 
         // Load shader from assets, panic if file not found (no fallback)
         let shader_src = assets::load_shader().expect("Failed to load voxel_raytracer.wgsl");
@@ -274,10 +303,12 @@ impl Renderer {
             pipeline,
             bind_group,
             uniform_buf,
+            light_buf,
             voxel_buf,
             palette_tex,
             light,
             post_process,
+            ui_system,
         }
     }
 
@@ -290,6 +321,7 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(gpu.device(), &self.config);
         self.post_process.resize(gpu, width, height);
+        self.ui_system.resize(gpu, width, height);
     }
 
     /// Render a frame: upload uniforms, draw fullscreen quad.
@@ -297,9 +329,13 @@ impl Renderer {
         &mut self,
         gpu: &GpuContext,
         uniforms: &GlobalUniforms,
+        lights: &LightBuffer,
+        ui_ctx: &UiContext,
     ) -> Result<(), wgpu::SurfaceError> {
         gpu.queue()
             .write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(uniforms));
+        gpu.queue()
+            .write_buffer(&self.light_buf, 0, bytemuck::bytes_of(lights));
 
         let output = self.surface.get_current_texture()?;
         let view = output
@@ -338,6 +374,9 @@ impl Renderer {
 
         // Run Bloom + Tone Mapping -> Swapchain
         self.post_process.render(gpu.device(), &mut encoder, &view);
+
+        // Render UI on top
+        self.ui_system.render(gpu, &view, &mut encoder, ui_ctx);
 
         gpu.queue().submit(std::iter::once(encoder.finish()));
         output.present();

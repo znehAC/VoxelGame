@@ -32,6 +32,8 @@ pub struct GlobalUniforms {
     pub sky_color: Vec4,
     /// Ground hemisphere color (.rgb = color, .a = unused).
     pub ground_color: Vec4,
+    /// Selected block position (.xyz = integer coords) + active flag (.w > 0.5 = active).
+    pub selected_block: Vec4,
 }
 
 impl GlobalUniforms {
@@ -49,6 +51,7 @@ impl GlobalUniforms {
         sky_intensity: f32,
         ground_color: [f32; 3],
         sun_shadow_max: f32,
+        selected_block: Option<[i32; 3]>,
     ) -> Self {
         let sd = glam::Vec3::from_array(sun_dir).normalize_or_zero();
         Self {
@@ -72,6 +75,11 @@ impl GlobalUniforms {
             sun_color: Vec4::new(sun_color[0], sun_color[1], sun_color[2], 0.0),
             sky_color: Vec4::new(sky_color[0], sky_color[1], sky_color[2], sky_intensity),
             ground_color: Vec4::new(ground_color[0], ground_color[1], ground_color[2], 0.0),
+            selected_block: if let Some(pos) = selected_block {
+                Vec4::new(pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0)
+            } else {
+                Vec4::new(0.0, 0.0, 0.0, 0.0)
+            },
         }
     }
 }
@@ -177,12 +185,35 @@ impl InputState {
         self
     }
 
-    /// Set modifier flags.
     pub fn with_modifiers(mut self, flags: u32) -> Self {
         self.input_flags.z = flags;
         self
     }
 }
+
+/// Point light structure matching shader definition.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct PointLight {
+    /// xyz = world position, w = radius
+    pub position: Vec4,
+    /// rgb = color, w = intensity
+    pub color: Vec4,
+    /// 1 = Cast Shadows, 0 = No Shadows
+    pub flags: u32,
+    /// 16-byte alignment padding
+    pub padding: [u32; 3],
+}
+
+/// Uniform buffer for point lights.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
+pub struct LightBuffer {
+    pub count: u32,
+    pub _pad: [u32; 3],
+    pub lights: [PointLight; 16],
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -192,8 +223,8 @@ mod tests {
     #[test]
     fn global_uniforms_layout() {
         // view_inverse (64) + proj_inverse (64) + cam_pos (16) + time+resolution+padding (16)
-        // + sun_dir (16) + sun_color (16) + sky_color (16) + ground_color (16) = 224
-        assert_eq!(size_of::<GlobalUniforms>(), 224);
+        // + sun_dir (16) + sun_color (16) + sky_color (16) + ground_color (16) + selected_block (16) = 240
+        assert_eq!(size_of::<GlobalUniforms>(), 240);
         assert_eq!(align_of::<GlobalUniforms>(), 16);
     }
 
@@ -203,4 +234,13 @@ mod tests {
         assert_eq!(size_of::<InputState>(), 112);
         assert_eq!(align_of::<InputState>(), 16);
     }
+
+    #[test]
+    fn light_buffer_layout() {
+        assert_eq!(size_of::<PointLight>(), 48);
+        assert_eq!(align_of::<PointLight>(), 16);
+        assert_eq!(size_of::<LightBuffer>(), 16 + 16 * 48);
+        assert_eq!(align_of::<LightBuffer>(), 16);
+    }
 }
+

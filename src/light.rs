@@ -24,6 +24,7 @@ impl LightPropagation {
     pub fn new(
         gpu: &GpuContext,
         voxel_buf: &wgpu::Buffer,
+        uniform_buf: &wgpu::Buffer,
         palette_tex: &wgpu::Texture,
         iterations: u32,
     ) -> Self {
@@ -97,6 +98,17 @@ impl LightPropagation {
                     },
                     count: None,
                 },
+                // 4: Global Uniforms
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -121,6 +133,10 @@ impl LightPropagation {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&palette_view),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uniform_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -144,6 +160,10 @@ impl LightPropagation {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&palette_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: uniform_buf.as_entire_binding(),
                 },
             ],
         });

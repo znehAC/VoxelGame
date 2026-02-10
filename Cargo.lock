@@ -131,6 +131,7 @@ name = "ara"
 version = "0.1.0"
 dependencies = [
  "ara-core",
+ "bytemuck",
  "env_logger",
  "log",
  "pollster",

@@ -10,6 +10,7 @@ struct GlobalUniforms {
     sun_color: vec4f,
     sky_color: vec4f,
     ground_color: vec4f,
+    selected_block: vec4f, // xyz = pos, w = active (1.0) or inactive (0.0)
 }
 
 struct VoxelData {
@@ -25,6 +26,23 @@ struct HitResult {
     voxel: VoxelData,
 }
 
+struct PointLight {
+    position: vec4f,       // xyz = world pos, w = radius
+    color: vec4f,          // rgb = color, w = intensity
+    flags: u32,            // 1 = Cast Shadows, 0 = No Shadows
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+struct LightBuffer {
+    count: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+    lights: array<PointLight, 16>,
+}
+
 const GRID_SIZE: u32 = 64u;
 const MAX_STEPS: u32 = 256u;
 
@@ -32,6 +50,7 @@ const MAX_STEPS: u32 = 256u;
 @group(0) @binding(2) var t_palette: texture_2d_array<f32>;
 @group(0) @binding(3) var s_palette: sampler;
 @group(0) @binding(4) var<storage, read> voxels: array<u32>;
+@group(0) @binding(5) var<uniform> point_lights: LightBuffer;
 
 @group(1) @binding(0) var t_light: texture_3d<f32>;
 @group(1) @binding(1) var s_light: sampler;
@@ -344,6 +363,82 @@ fn interleaved_gradient_noise(pixel_pos: vec2f) -> f32 {
     return fract(magic.z * fract(dot(pixel_pos, magic.xy)));
 }
 
+fn evaluate_point_light(light: PointLight, pos: vec3f, normal: vec3f) -> vec3f {
+    let to_light = light.position.xyz - pos;
+    let dist = length(to_light);
+    let radius = light.position.w;
+
+    if (dist > radius) {
+        return vec3f(0.0);
+    }
+
+    let light_dir = normalize(to_light);
+    let ndotl = max(dot(normal, light_dir), 0.0);
+    
+    if (ndotl <= 0.0) {
+        return vec3f(0.0);
+    }
+
+    // Attenuation: intensity / (distance^2 + 1.0)
+    let intensity = light.color.w;
+    let attenuation = intensity / (dist * dist + 1.0);
+    
+    // Shadow Logic
+    var visibility = 1.0;
+    if (light.flags == 1u) {
+        // Bias start position to avoid self-shadowing
+        let shadow_origin = pos + normal * 0.05;
+        // Check visibility up to the light source
+        visibility = trace_visibility(shadow_origin, light_dir, dist);
+    }
+
+    return light.color.rgb * attenuation * ndotl * visibility;
+}
+
+fn apply_selection_outline(color: vec3f, hit: HitResult, dir: vec3f) -> vec3f {
+    // Check if selection is active
+    if (globals.selected_block.w < 0.5) {
+        return color;
+    }
+
+    let sel_pos = vec3i(globals.selected_block.xyz);
+    
+    // Identify the voxel coordinate of the hit
+    // Offset slightly into the voxel to ensure we floor correctly
+    let voxel_pos = vec3i(floor(hit.pos - dir * 0.001));
+
+    if (voxel_pos.x != sel_pos.x || voxel_pos.y != sel_pos.y || voxel_pos.z != sel_pos.z) {
+        return color;
+    }
+
+    // Determine local UV on the face [0..1]
+    // We can use the fractional part of hit.pos, but we need to know which face.
+    // normal tells us the axis.
+    let rel = hit.pos - floor(hit.pos);
+    var uv = vec2f(0.0);
+    
+    let n = abs(hit.normal);
+    if (n.x > 0.5) {
+        uv = rel.yz;
+    } else if (n.y > 0.5) {
+        uv = rel.xz;
+    } else {
+        uv = rel.xy;
+    }
+
+    // Distance to nearest edge
+    let d = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    
+    // Thickness of the line
+    let thickness = 0.02;
+
+    if (d < thickness) {
+        return vec3f(0.0); // Black outline
+    }
+
+    return color;
+}
+
 fn shade_pbr(hit: HitResult, dir: vec3f, screen_pos: vec2f) -> vec3f {
     let pu = hit.voxel.id % 256u;
     let pv = hit.voxel.id / 256u;
@@ -400,8 +495,16 @@ fn shade_pbr(hit: HitResult, dir: vec3f, screen_pos: vec2f) -> vec3f {
         sun_light *= sun_vis;
     }
 
-    // Total Irradiance = Direct + Indirect (occluded)
-    let total_light = sun_light + voxel_light * ao;
+    // Dynamic Point Lights
+    var dynamic_light = vec3f(0.0);
+    let count = min(point_lights.count, 16u);
+    
+    for (var i = 0u; i < count; i++) {
+        dynamic_light += evaluate_point_light(point_lights.lights[i], hit.pos, hit.normal);
+    }
+
+    // Total Irradiance = Direct + Indirect (occluded) + Dynamic
+    let total_light = sun_light + voxel_light * ao + dynamic_light;
 
     // Procedural Bump Mapping
     let noise_scale = 150.0;
@@ -439,12 +542,19 @@ fn shade_pbr(hit: HitResult, dir: vec3f, screen_pos: vec2f) -> vec3f {
     // Emission is added at the end for visual glow of the surface itself.
     var final_hdr = (diffuse * total_light + specular) + emit;
     
+    // Apply Selection Outline
+    final_hdr = apply_selection_outline(final_hdr, hit, dir);
+
     return final_hdr;
 }
 
 fn sky(dir: vec3f) -> vec3f {
     // Y-up: positive dir.y is towards zenith
-    return vec3f(0.0);
+    let t = clamp(dir.y * 0.5 + 0.5, 0.0, 1.0);
+    // Mix between horizon (darker/foggy) and zenith (sky color)
+    let horizon = globals.sky_color.rgb * 0.3;
+    let zenith = globals.sky_color.rgb;
+    return mix(horizon, zenith, pow(t, 0.5));
 }
 
 struct VertexOutput {

@@ -6,6 +6,7 @@ mod gpu;
 mod light;
 mod postprocess;
 mod renderer;
+mod ui;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -19,8 +20,10 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
 use ara_core::{
-    dda_raycast, Action, BlockRegistry, GlobalUniforms, InputManager, PackedVoxel, GRID_SIZE,
+    dda_raycast, Action, BlockRegistry, GlobalUniforms, InputManager, LightBuffer, PackedVoxel,
+    PointLight, GRID_SIZE,
 };
+use ara_core::glam;
 use camera::FpsCamera;
 use gpu::GpuContext;
 use renderer::Renderer;
@@ -384,9 +387,43 @@ impl ApplicationHandler for App {
                         0.15,
                         [0.15, 0.1, 0.05],
                         128.0,
+                        // Raycast logic is already run in Debug HUD section above (lines 331-341 context)
+                        // Reuse that logic or just recalculate.
+                        // Let's recalculate cleanly or store it.
+                        {
+                            let dir = self.camera.forward();
+                            dda_raycast(&self.voxels, self.camera.position, dir, 10.0).map(|hit| hit.grid_pos.to_array())
+                        }
                     );
 
-                    match renderer.render(gpu, &uniforms) {
+                    // Dynamic Lights
+                    let mut lights = LightBuffer::default();
+                    
+                    // 1. Player Torch (warm light)
+                    lights.lights[0] = PointLight {
+                        position: (self.camera.position + self.camera.forward() * 0.5).extend(8.0), // radius = 8.0
+                        color: glam::Vec4::new(1.0, 0.6, 0.3, 2.0), // intensity = 2.0
+                        flags: 1, // Shadows enabled (maybe?)
+                        padding: [0; 3],
+                    };
+                    lights.count += 1;
+
+                    // 2. Lava Orb Light (red/orange)
+                    if curr_x < gs && curr_z < gs {
+                        lights.lights[lights.count as usize] = PointLight {
+                            position: glam::Vec4::new(curr_x as f32 + 0.5, 25.0 + 0.5, curr_z as f32 + 0.5, 12.0),
+                            color: glam::Vec4::new(1.0, 0.2, 0.0, 3.0),
+                            flags: 0, // No shadows for now to save perf or if inside block
+                            padding: [0; 3],
+                        };
+                        lights.count += 1;
+                    }
+
+                    match renderer.render(gpu, &uniforms, &lights, &crate::ui::UiContext {
+                        screen_width: size.width as f32,
+                        screen_height: size.height as f32,
+                        selected_block_name: self.target_block_name.clone().unwrap_or_default(),
+                    }) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             let size = window.inner_size();
