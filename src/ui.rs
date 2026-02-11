@@ -1,7 +1,5 @@
 use crate::gpu::GpuContext;
 use bytemuck::{Pod, Zeroable};
-#[allow(unused_imports)]
-use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -88,7 +86,7 @@ pub struct UiContext {
 }
 
 pub trait UiComponent {
-    #[allow(unused_variables)]
+    #[allow(dead_code, unused_variables)]
     fn update(&mut self, ctx: &UiContext) {}
     fn draw(&self, batch: &mut UiBatcher, ctx: &UiContext);
 }
@@ -396,7 +394,7 @@ impl UiSystem {
 
         if batch.vertices.len() > self.vertex_capacity || batch.indices.len() > self.index_capacity
         {
-            eprintln!("UI Batch overflow! Increase capacity.");
+            log::warn!("UI batch overflow");
             // For now, just truncate or return to avoid crash
         }
 

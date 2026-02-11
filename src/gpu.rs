@@ -4,6 +4,7 @@
 
 /// Core GPU state that can operate headless (compute-only) or with a surface.
 pub struct GpuContext {
+    /// Must outlive all surfaces created from it.
     #[allow(dead_code)]
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,

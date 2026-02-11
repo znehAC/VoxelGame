@@ -20,6 +20,29 @@ pub enum AaMode {
     TaaThenSmaa,
 }
 
+const BLIT_SHADER_SRC: &str = r#"
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
+    var pos = array<vec2<f32>, 3>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 3.0, -1.0),
+        vec2<f32>(-1.0,  3.0)
+    );
+    return vec4<f32>(pos[vertex_index], 0.0, 1.0);
+}
+
+@group(0) @binding(0)
+var source_tex: texture_2d<f32>;
+@group(0) @binding(1)
+var source_sampler: sampler;
+
+@fragment
+fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
+    let uv = frag_coord.xy / vec2<f32>(textureDimensions(source_tex));
+    return textureSample(source_tex, source_sampler, uv);
+}
+"#;
+
 /// Manages surface presentation with palette-texture + voxel-SSBO pipeline.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -38,8 +61,18 @@ pub struct Renderer {
     final_sdr_texture: wgpu::Texture,
     final_sdr_view: wgpu::TextureView,
     ui_system: UiSystem,
-    pub aa_mode: AaMode,
-    pub smaa_debug_mode: u32,
+    aa_mode: AaMode,
+
+    // Bloom parameters
+    bloom_threshold: f32,
+    bloom_intensity: f32,
+    bloom_exposure: f32,
+
+    // Cached blit pipeline resources
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bind_group_layout: wgpu::BindGroupLayout,
+    blit_sampler: wgpu::Sampler,
+    blit_bind_group: wgpu::BindGroup,
 
     // TAA-related fields
     velocity_texture: wgpu::Texture,
@@ -59,6 +92,9 @@ impl Renderer {
         height: u32,
         palette_data: &[u8],
         voxel_data: &[PackedVoxel],
+        bloom_threshold: f32,
+        bloom_intensity: f32,
+        bloom_exposure: f32,
     ) -> Self {
         let caps = surface.get_capabilities(gpu.adapter());
         let format = caps
@@ -108,6 +144,98 @@ impl Renderer {
 
         // Initialize UI System
         let ui_system = UiSystem::new(gpu, format);
+
+        // Initialize Blit Pipeline (cached, not recreated per frame)
+        let blit_bind_group_layout =
+            gpu.device()
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("Blit Bind Group Layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let blit_sampler = gpu.device().create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Blit Sampler"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        let blit_bind_group = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blit Bind Group"),
+            layout: &blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&final_sdr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&blit_sampler),
+                },
+            ],
+        });
+
+        let blit_shader =
+            gpu.device()
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Blit Shader"),
+                    source: wgpu::ShaderSource::Wgsl(BLIT_SHADER_SRC.into()),
+                });
+
+        let blit_pipeline_layout =
+            gpu.device()
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Blit Pipeline Layout"),
+                    bind_group_layouts: &[&blit_bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let blit_pipeline =
+            gpu.device()
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("Blit Pipeline"),
+                    layout: Some(&blit_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &blit_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &blit_shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format,
+                            blend: None,
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState::default(),
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                });
 
         // Palette texture: 256x256, 2 layers, Rgba8UnormSrgb
         let palette_tex = gpu.device().create_texture(&wgpu::TextureDescriptor {
@@ -317,7 +445,6 @@ impl Renderer {
                 });
 
         // Initialize TAA Pipeline
-        // Use TaaPreset::TestExtreme for very obvious TAA effect (50% blend, no clipping)
         let taa = TaaPipeline::new(
             gpu,
             width,
@@ -400,8 +527,14 @@ impl Renderer {
             final_sdr_texture,
             final_sdr_view,
             ui_system,
-            aa_mode: AaMode::TaaThenSmaa, // Default to TAA + SMAA
-            smaa_debug_mode: 0,
+            aa_mode: AaMode::TaaThenSmaa,
+            bloom_threshold,
+            bloom_intensity,
+            bloom_exposure,
+            blit_pipeline,
+            blit_bind_group_layout,
+            blit_sampler,
+            blit_bind_group,
             velocity_texture,
             velocity_view,
             prev_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
@@ -443,6 +576,22 @@ impl Renderer {
         });
         self.final_sdr_view = self.final_sdr_texture.create_view(&Default::default());
 
+        // Recreate blit bind group (references final_sdr_view)
+        self.blit_bind_group = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Blit Bind Group"),
+            layout: &self.blit_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&self.final_sdr_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.blit_sampler),
+                },
+            ],
+        });
+
         // Recreate velocity texture
         self.velocity_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
             label: Some("Velocity Texture"),
@@ -463,318 +612,12 @@ impl Renderer {
         self.ui_system.resize(gpu, width, height);
     }
 
-    /// Render post-processing (bloom) from a specific input view.
-    /// Used to pipeline TAA output directly into bloom without copy.
-    fn render_post_process_from_view(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        input_view: &wgpu::TextureView,
-        output_view: &wgpu::TextureView,
-    ) {
-        // Use the post-process pipeline but with a custom input view
-        // We need to manually recreate the bind groups with the input_view
-
-        // 1. Threshold: Input -> Bloom A (half-res)
-        {
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Threshold Bind Group (TAA Input)"),
-                layout: &self.post_process.threshold_pass.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(input_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.post_process.sampler),
-                    },
-                ],
-            });
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Threshold Pass (TAA Input)"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.post_process.bloom_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            pass.set_pipeline(&self.post_process.threshold_pass.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let threshold = 1.0f32;
-            pass.set_push_constants(
-                wgpu::ShaderStages::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&threshold),
-            );
-            pass.draw(0..3, 0..1);
-        }
-
-        // 2. Blur Horizontal: Bloom A -> Bloom B
-        {
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Blur H Bind Group"),
-                layout: &self.post_process.blur_pass.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.post_process.bloom_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.post_process.sampler),
-                    },
-                ],
-            });
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Blur H Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.post_process.blur_temp_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            pass.set_pipeline(&self.post_process.blur_pass.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let dir = [1.0f32, 0.0f32];
-            pass.set_push_constants(wgpu::ShaderStages::FRAGMENT, 0, bytemuck::bytes_of(&dir));
-            pass.draw(0..3, 0..1);
-        }
-
-        // 3. Blur Vertical: Bloom B -> Bloom A
-        {
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Blur V Bind Group"),
-                layout: &self.post_process.blur_pass.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(
-                            &self.post_process.blur_temp_view,
-                        ),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.post_process.sampler),
-                    },
-                ],
-            });
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Blur V Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.post_process.bloom_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            pass.set_pipeline(&self.post_process.blur_pass.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            let dir = [0.0f32, 1.0f32];
-            pass.set_push_constants(wgpu::ShaderStages::FRAGMENT, 0, bytemuck::bytes_of(&dir));
-            pass.draw(0..3, 0..1);
-        }
-
-        // 4. Composite: Input HDR + Bloom A -> Output SDR
-        {
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Composite Bind Group (TAA Input)"),
-                layout: &self.post_process.composite_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(input_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.post_process.sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: wgpu::BindingResource::TextureView(&self.post_process.bloom_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::Sampler(&self.post_process.sampler),
-                    },
-                ],
-            });
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Composite Pass (TAA Input)"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: output_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-
-            pass.set_pipeline(&self.post_process.composite_pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-
-            struct CompositeParams {
-                intensity: f32,
-                exposure: f32,
-            }
-            let params = CompositeParams {
-                intensity: 0.8,
-                exposure: 1.0,
-            };
-            pass.set_push_constants(
-                wgpu::ShaderStages::FRAGMENT,
-                0,
-                bytemuck::bytes_of(&[params.intensity, params.exposure]),
-            );
-            pass.draw(0..3, 0..1);
-        }
-    }
-
-    /// Simple blit from final SDR texture to screen.
-    /// Used when TAA mode needs to output directly without additional AA.
+    /// Simple blit from final SDR texture to screen using cached pipeline.
     fn blit_final_to_screen(
         &self,
-        device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         output_view: &wgpu::TextureView,
     ) {
-        // Create a simple bind group layout for blitting
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Blit Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Blit Sampler"),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
-        });
-
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Blit Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&self.final_sdr_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
-            ],
-        });
-
-        // Simple pass-through shader for blitting
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Blit Shader"),
-            source: wgpu::ShaderSource::Wgsl(
-                r#"
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> @builtin(position) vec4<f32> {
-    var pos = array<vec2<f32>, 3>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 3.0, -1.0),
-        vec2<f32>(-1.0,  3.0)
-    );
-    return vec4<f32>(pos[vertex_index], 0.0, 1.0);
-}
-
-@group(0) @binding(0)
-var source_tex: texture_2d<f32>;
-@group(0) @binding(1)
-var source_sampler: sampler;
-
-@fragment
-fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
-    let uv = frag_coord.xy / vec2<f32>(textureDimensions(source_tex));
-    return textureSample(source_tex, source_sampler, uv);
-}
-"#
-                .into(),
-            ),
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Blit Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Blit Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: self.config.format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Blit Final to Screen"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -790,38 +633,9 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
             occlusion_query_set: None,
         });
 
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_pipeline(&self.blit_pipeline);
+        pass.set_bind_group(0, &self.blit_bind_group, &[]);
         pass.draw(0..3, 0..1);
-    }
-
-    /// Cycle SMAA Debug Mode
-    /// 0=Normal, 1=UVs, 2=Edge Deltas, 3=Edge Threshold, 4=Edges Input, 5=Search Dist,
-    /// 6=Area Horiz, 7=Area Vert, 8=Weights Combined, 9=Final Weights
-    pub fn cycle_smaa_debug(&mut self, gpu: &GpuContext) {
-        self.smaa_debug_mode = (self.smaa_debug_mode + 1) % 10;
-        self.smaa.set_debug_mode(gpu.queue(), self.smaa_debug_mode);
-        let mode_name = match self.smaa_debug_mode {
-            0 => "Normal",
-            1 => "UV Test (gradient)",
-            2 => "Edge Deltas (20x boost)",
-            3 => "Edge Threshold Result",
-            4 => "Edges Input to Weights Pass",
-            5 => "Search Distances",
-            6 => "Area Weights (Horizontal)",
-            7 => "Area Weights (Vertical)",
-            8 => "Combined Weights",
-            9 => "Final Blend Weights",
-            _ => "Unknown",
-        };
-        println!("SMAA Debug Mode: {} ({})", self.smaa_debug_mode, mode_name);
-    }
-
-    /// Cycle TAA Debug Mode
-    /// 0=Normal, 1=Velocity, 2=Neighborhood Min, 3=Neighborhood Max,
-    /// 4=Raw History, 5=Clipped History, 6=Current Only
-    pub fn cycle_taa_debug(&mut self, gpu: &GpuContext) {
-        self.taa.cycle_debug_mode(gpu);
     }
 
     /// Initialize the previous view-projection matrix with the camera's initial matrix.
@@ -841,10 +655,14 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
         self.prev_view_proj
     }
 
-    /// Get current frame count
-    #[allow(dead_code)]
-    pub fn frame_count(&self) -> u64 {
-        self.frame_count
+    /// Get current anti-aliasing mode.
+    pub fn aa_mode(&self) -> AaMode {
+        self.aa_mode
+    }
+
+    /// Set the anti-aliasing mode.
+    pub fn set_aa_mode(&mut self, mode: AaMode) {
+        self.aa_mode = mode;
     }
 
     /// Render a frame: upload uniforms, draw fullscreen quad.
@@ -908,25 +726,22 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
             pass.draw(0..3, 0..1);
         }
 
+        let (bt, bi, be) = (self.bloom_threshold, self.bloom_intensity, self.bloom_exposure);
+
         match self.aa_mode {
             AaMode::Fxaa => {
-                // Bloom -> Final SDR (Intermediate)
                 self.post_process
-                    .render(gpu.device(), &mut encoder, &self.final_sdr_view);
-                // FXAA -> Screen
+                    .render(gpu.device(), &mut encoder, &self.final_sdr_view, None, bt, bi, be);
                 self.fxaa
                     .render(gpu.device(), &mut encoder, &self.final_sdr_view, &view);
             }
             AaMode::Smaa => {
-                // Bloom -> Final SDR (Intermediate)
                 self.post_process
-                    .render(gpu.device(), &mut encoder, &self.final_sdr_view);
-                // SMAA -> Screen
+                    .render(gpu.device(), &mut encoder, &self.final_sdr_view, None, bt, bi, be);
                 self.smaa
                     .render(gpu.device(), &mut encoder, &self.final_sdr_view, &view);
             }
             AaMode::Taa => {
-                // TAA Resolve: HDR + Velocity -> TAA Output (ping-pong)
                 self.taa.resolve(
                     gpu.device(),
                     gpu.queue(),
@@ -934,21 +749,17 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
                     self.post_process.hdr_view(),
                     &self.velocity_view,
                 );
-
-                // Bloom: TAA Output -> Final SDR (direct, no copy)
                 let taa_output = self.taa.get_current_output_view();
-                self.render_post_process_from_view(
+                self.post_process.render(
                     gpu.device(),
                     &mut encoder,
-                    taa_output,
                     &self.final_sdr_view,
+                    Some(taa_output),
+                    bt, bi, be,
                 );
-
-                // Blit Final SDR -> Screen
-                self.blit_final_to_screen(gpu.device(), &mut encoder, &view);
+                self.blit_final_to_screen(&mut encoder, &view);
             }
             AaMode::TaaThenSmaa => {
-                // TAA Resolve: HDR + Velocity -> TAA Output (ping-pong)
                 self.taa.resolve(
                     gpu.device(),
                     gpu.queue(),
@@ -956,23 +767,20 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
                     self.post_process.hdr_view(),
                     &self.velocity_view,
                 );
-
-                // Bloom: TAA Output -> Final SDR (direct, no copy)
                 let taa_output = self.taa.get_current_output_view();
-                self.render_post_process_from_view(
+                self.post_process.render(
                     gpu.device(),
                     &mut encoder,
-                    taa_output,
                     &self.final_sdr_view,
+                    Some(taa_output),
+                    bt, bi, be,
                 );
-
-                // SMAA: Final SDR -> Screen
                 self.smaa
                     .render(gpu.device(), &mut encoder, &self.final_sdr_view, &view);
             }
             AaMode::None => {
-                // Bloom -> Screen (Direct)
-                self.post_process.render(gpu.device(), &mut encoder, &view);
+                self.post_process
+                    .render(gpu.device(), &mut encoder, &view, None, bt, bi, be);
             }
         }
 

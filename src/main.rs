@@ -6,6 +6,7 @@ mod gpu;
 mod light;
 mod postprocess;
 mod renderer;
+mod settings;
 mod ui;
 
 use std::sync::Arc;
@@ -56,6 +57,13 @@ fn generate_room_scene() -> Vec<PackedVoxel> {
     let min_xz = 10;
     let max_xz = 53;
 
+    // Simple pseudo-random number generator for visual variants
+    let mut rng_seed = 12345u32;
+    let mut next_variant = || -> u8 {
+        rng_seed = rng_seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((rng_seed >> 16) & 0xF) as u8
+    };
+
     for z in 0..size {
         for x in 0..size {
             for y in 0..size {
@@ -65,7 +73,9 @@ fn generate_room_scene() -> Vec<PackedVoxel> {
                 if y == ground_y && x >= min_xz && x <= max_xz && z >= min_xz && z <= max_xz {
                     // Stone (1) / Grass (3) checkerboard
                     let mat = if (x + z) % 2 == 0 { 1u16 } else { 3u16 };
-                    voxels[idx] = PackedVoxel::new(mat);
+                    // Use random variant for stone to test noise
+                    let variant = if mat == 1 { next_variant() } else { 0 };
+                    voxels[idx] = PackedVoxel::with_all(mat, 0, 0, variant, 0);
                     continue;
                 }
 
@@ -83,7 +93,8 @@ fn generate_room_scene() -> Vec<PackedVoxel> {
                     if (is_wall_x && z >= min_xz && z <= max_xz)
                         || (is_wall_z && x >= min_xz && x <= max_xz)
                     {
-                        voxels[idx] = PackedVoxel::new(1); // Stone
+                        // Assign random variant to wall stones too
+                        voxels[idx] = PackedVoxel::with_all(1, 0, 0, next_variant(), 0);
                         continue;
                     }
                 }
@@ -110,6 +121,7 @@ struct App {
     registry: Option<BlockRegistry>,
     camera: FpsCamera,
     input: InputManager,
+    settings: settings::RenderSettings,
     last_frame_time: Option<Instant>,
     start_time: Instant,
     frame_count: u32,
@@ -122,13 +134,23 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        let settings = settings::RenderSettings::default();
         Self {
             window: None,
             gpu: None,
             renderer: None,
             registry: None,
-            camera: FpsCamera::new(INITIAL_WIDTH as f32 / INITIAL_HEIGHT as f32),
+            camera: FpsCamera::new(
+                INITIAL_WIDTH as f32 / INITIAL_HEIGHT as f32,
+                settings.camera_start_position,
+                settings.camera_start_pitch,
+                settings.camera_fov,
+                settings.camera_move_speed,
+                settings.camera_sprint_multiplier,
+                settings.camera_mouse_sensitivity,
+            ),
             input: default_input_bindings(),
+            settings,
             last_frame_time: None,
             start_time: Instant::now(),
             frame_count: 0,
@@ -206,6 +228,9 @@ impl ApplicationHandler for App {
             size.height,
             &palette_data,
             &test_voxels,
+            self.settings.bloom_threshold,
+            self.settings.bloom_intensity,
+            self.settings.bloom_exposure,
         );
 
         let aspect = size.width as f32 / size.height.max(1) as f32;
@@ -254,9 +279,9 @@ impl ApplicationHandler for App {
                                 let palette = registry.generate_texture_data();
                                 renderer.reload_palette(gpu, &palette);
                                 self.registry = Some(registry);
-                                println!("Assets reloaded successfully.");
+                                info!("Assets reloaded");
                             }
-                            Err(e) => eprintln!("Failed to reload assets: {e}"),
+                            Err(e) => error!("Failed to reload assets: {e}"),
                         }
                     }
                     return;
@@ -265,30 +290,15 @@ impl ApplicationHandler for App {
                 // F2: Cycle Anti-Aliasing Mode
                 if key == KeyCode::F2 && state == ElementState::Pressed {
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.aa_mode = match renderer.aa_mode {
+                        let next = match renderer.aa_mode() {
                             AaMode::None => AaMode::Fxaa,
                             AaMode::Fxaa => AaMode::Smaa,
                             AaMode::Smaa => AaMode::Taa,
                             AaMode::Taa => AaMode::TaaThenSmaa,
                             AaMode::TaaThenSmaa => AaMode::None,
                         };
-                        println!("Anti-Aliasing Mode: {:?}", renderer.aa_mode);
-                    }
-                    return;
-                }
-
-                // F3: Cycle TAA Debug Mode
-                if key == KeyCode::F3 && state == ElementState::Pressed {
-                    if let (Some(renderer), Some(gpu)) = (&mut self.renderer, &self.gpu) {
-                        renderer.cycle_taa_debug(gpu);
-                    }
-                    return;
-                }
-
-                // F4: Cycle SMAA Debug Mode
-                if key == KeyCode::F4 && state == ElementState::Pressed {
-                    if let (Some(renderer), Some(gpu)) = (&mut self.renderer, &self.gpu) {
-                        renderer.cycle_smaa_debug(gpu);
+                        renderer.set_aa_mode(next);
+                        info!("Anti-Aliasing Mode: {:?}", renderer.aa_mode());
                     }
                     return;
                 }
@@ -413,7 +423,8 @@ impl ApplicationHandler for App {
                     let (width, height) = (size.width as f32, size.height as f32);
 
                     // Apply TAA jitter to camera (sub-pixel offset)
-                    let jitter = if matches!(renderer.aa_mode, AaMode::Taa | AaMode::TaaThenSmaa) {
+                    let jitter = if matches!(renderer.aa_mode(), AaMode::Taa | AaMode::TaaThenSmaa)
+                    {
                         self.jitter.next()
                     } else {
                         ara_core::glam::Vec2::ZERO
@@ -437,19 +448,20 @@ impl ApplicationHandler for App {
                         .proj_inverse_jittered(width, height)
                         .to_cols_array_2d();
 
+                    let s = &self.settings;
                     let uniforms = GlobalUniforms::with_view_proj(
                         self.camera.view_inverse().to_cols_array_2d(),
                         proj_inverse_jittered,
                         self.camera.position.into(),
                         time,
                         [width, height],
-                        [0.4, -0.7, 0.3],
-                        2.0,
-                        [1.0, 0.95, 0.85],
-                        [0.4, 0.6, 0.9],
-                        0.15,
-                        [0.15, 0.1, 0.05],
-                        128.0,
+                        s.sun_direction,
+                        s.sun_intensity,
+                        s.sun_color,
+                        s.sky_color,
+                        s.sky_intensity,
+                        s.ground_color,
+                        s.light_max_distance,
                         {
                             let dir = self.camera.forward();
                             dda_raycast(&self.voxels, self.camera.position, dir, 10.0)

@@ -63,37 +63,10 @@ impl Default for SmaaConfig {
     }
 }
 
-// Simple debug display shader
-const DEBUG_DISPLAY_SHADER: &str = r#"
-@group(0) @binding(0) var t_input: texture_2d<f32>;
-@group(0) @binding(1) var s_sampler: sampler;
-
-struct VertexOutput {
-    @builtin(position) position: vec4f,
-    @location(0) uv: vec2f,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
-    let uv = vec2f(f32((vertex_index << 1u) & 2u), f32(vertex_index & 2u));
-    let pos = vec4f(uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
-    return VertexOutput(pos, uv);
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4f {
-    let color = textureSample(t_input, s_sampler, in.uv);
-    // Expand RG8 to RGB for visibility
-    return vec4f(color.r, color.g, color.b, 1.0);
-}
-"#;
-
 pub struct SmaaPipeline {
     edges_pipeline: wgpu::RenderPipeline,
     weights_pipeline: wgpu::RenderPipeline,
     blend_pipeline: wgpu::RenderPipeline,
-    debug_display_pipeline: wgpu::RenderPipeline,
-    debug_display_bind_group_layout: wgpu::BindGroupLayout,
 
     bind_group_layout: wgpu::BindGroupLayout,
 
@@ -112,9 +85,6 @@ pub struct SmaaPipeline {
 
     width: u32,
     height: u32,
-    debug_mode: u32,
-    #[allow(dead_code)]
-    config: SmaaConfig,
 }
 
 impl SmaaPipeline {
@@ -385,72 +355,10 @@ impl SmaaPipeline {
         );
         let weights_view = weights_tex.create_view(&Default::default());
 
-        // 7. Create Debug Display Pipeline (for viewing intermediate textures)
-        let debug_display_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("SMAA Debug Display Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
-        let debug_display_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("SMAA Debug Display Shader"),
-            source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(DEBUG_DISPLAY_SHADER)),
-        });
-
-        let debug_display_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("SMAA Debug Display Pipeline Layout"),
-            bind_group_layouts: &[&debug_display_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let debug_display_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("SMAA Debug Display"),
-            layout: Some(&debug_display_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &debug_display_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &debug_display_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
         let pipeline = Self {
             edges_pipeline,
             weights_pipeline,
             blend_pipeline,
-            debug_display_pipeline,
-            debug_display_bind_group_layout,
             bind_group_layout,
             area_view,
             search_view,
@@ -463,8 +371,6 @@ impl SmaaPipeline {
             metrics_buf,
             width,
             height,
-            debug_mode: 0,
-            config,
         };
 
         pipeline.update_buffer(queue);
@@ -529,41 +435,13 @@ impl SmaaPipeline {
             self.height as f32,
         ];
 
-        // Debug print to verify mode is being set
-        if self.debug_mode != 0 {
-            println!("SMAA: Updating debug mode to {}", self.debug_mode);
-        }
-
         // WGSL uniform layout: vec4f (16 bytes) + u32 (4 bytes) + 12 bytes padding = 32 bytes
         let mut data = Vec::with_capacity(32);
         data.extend_from_slice(bytemuck::cast_slice(&metrics));
-        data.extend_from_slice(bytemuck::cast_slice(&[self.debug_mode]));
-        data.extend_from_slice(&[0u8; 12]); // Padding to 32 bytes
+        data.extend_from_slice(bytemuck::cast_slice(&[0u32]));
+        data.extend_from_slice(&[0u8; 12]);
 
         queue.write_buffer(&self.metrics_buf, 0, &data);
-    }
-
-    pub fn set_debug_mode(&mut self, queue: &wgpu::Queue, mode: u32) {
-        self.debug_mode = mode;
-        self.update_buffer(queue);
-    }
-
-    /// Get current configuration
-    #[allow(dead_code)]
-    pub fn config(&self) -> &SmaaConfig {
-        &self.config
-    }
-
-    /// Get current preset (approximate)
-    #[allow(dead_code)]
-    pub fn preset(&self) -> SmaaPreset {
-        match (self.config.threshold, self.config.max_search_steps) {
-            (0.15, 4) => SmaaPreset::Low,
-            (0.10, 8) => SmaaPreset::Medium,
-            (0.10, 16) => SmaaPreset::High,
-            (0.05, 32) => SmaaPreset::Ultra,
-            _ => SmaaPreset::Custom,
-        }
     }
 
     pub fn render(
@@ -573,15 +451,7 @@ impl SmaaPipeline {
         input_view: &wgpu::TextureView,
         output_view: &wgpu::TextureView,
     ) {
-        // Determine which pass should render to screen based on debug mode
-        // Debug modes 1-3: Show edge detection output
-        // Debug modes 4-8: Show weights output
-        // Debug mode 9, 0: Full pipeline with blend output
-        
-        let debug_edges = self.debug_mode >= 1 && self.debug_mode <= 3;
-        let debug_weights = self.debug_mode >= 4 && self.debug_mode <= 8;
-        
-        // Pass 1: Edge Detection (always render to edges_view)
+        // Pass 1: Edge Detection
         {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("SMAA Edges BG"),
@@ -632,45 +502,8 @@ impl SmaaPipeline {
             rpass.set_bind_group(0, &bind_group, &[]);
             rpass.draw(0..3, 0..1);
         }
-        
-        // If debugging edges, blit edges_view to output and return
-        if debug_edges {
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("SMAA Debug Display BG"),
-                layout: &self.debug_display_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.edges_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                    },
-                ],
-            });
 
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("SMAA Debug Display Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: output_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            rpass.set_pipeline(&self.debug_display_pipeline);
-            rpass.set_bind_group(0, &bind_group, &[]);
-            rpass.draw(0..3, 0..1);
-            return;
-        }
-
-        // Pass 2: Blending Weights (always render to weights_view)
+        // Pass 2: Blending Weights
         {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("SMAA Weights BG"),
@@ -721,45 +554,8 @@ impl SmaaPipeline {
             rpass.set_bind_group(0, &bind_group, &[]);
             rpass.draw(0..3, 0..1);
         }
-        
-        // If debugging weights, blit weights_view to output and return
-        if debug_weights {
-            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("SMAA Debug Display BG"),
-                layout: &self.debug_display_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&self.weights_view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&self.sampler_linear),
-                    },
-                ],
-            });
 
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("SMAA Debug Display Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: output_view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            rpass.set_pipeline(&self.debug_display_pipeline);
-            rpass.set_bind_group(0, &bind_group, &[]);
-            rpass.draw(0..3, 0..1);
-            return;
-        }
-
-        // Pass 3: Neighborhood Blending (normal or debug mode 9)
+        // Pass 3: Neighborhood Blending
         {
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("SMAA Blend BG"),

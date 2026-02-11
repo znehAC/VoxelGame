@@ -200,7 +200,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     
     let blend_alpha = uniforms.params.x;
     let enable_sharpening = uniforms.params.y > 0.5;
-    let debug_mode = i32(uniforms.params.z);
     let has_valid_history = uniforms.params.w > 0.5;
     let use_variance_clamp = uniforms.flags.x > 0.5;
     let use_ycocg = uniforms.flags.y > 0.5;
@@ -254,52 +253,6 @@ fn fs_main(@builtin(position) frag_coord: vec4f) -> @location(0) vec4f {
     } else {
         // No history available, pass through current
         result_hdr = current_hdr;
-    }
-    
-    // 5. Debug Overlays
-    switch debug_mode {
-        case 1: { // Velocity
-            let v = velocity * 100.0 + 0.5; // Scale up for visibility
-            result_hdr = vec3f(v.x, v.y, 0.0);
-        }
-        case 2: { // Neighborhood Min (RGB or YCoCg->RGB)
-            let n = get_neighborhood(uv, texel_size, use_ycocg);
-            if (use_ycocg) { result_hdr = reinhard_inverse(ycocg_to_rgb(n.min_val)); }
-            else { result_hdr = reinhard_inverse(n.min_val); }
-        }
-        case 3: { // Neighborhood Max
-            let n = get_neighborhood(uv, texel_size, use_ycocg);
-            if (use_ycocg) { result_hdr = reinhard_inverse(ycocg_to_rgb(n.max_val)); }
-            else { result_hdr = reinhard_inverse(n.max_val); }
-        }
-        case 4: { // Raw History Reprojected
-             if (history_valid_spatial) { result_hdr = history_hdr; }
-             else { result_hdr = vec3f(1.0, 0.0, 0.0); }
-        }
-        case 5: { // Clipped History
-            if (history_valid_spatial) {
-                let n = get_neighborhood(uv, texel_size, use_ycocg);
-                let h_tm = reinhard_tonemap(history_hdr);
-                var h_clipped = h_tm;
-                if (use_ycocg) {
-                   h_clipped = ycocg_to_rgb(clamp(rgb_to_ycocg(h_tm), n.min_val, n.max_val));
-                } else {
-                   h_clipped = clamp(h_tm, n.min_val, n.max_val);
-                }
-                result_hdr = reinhard_inverse(h_clipped);
-            } else {
-                result_hdr = vec3f(1.0, 0.0, 0.0);
-            }
-        }
-        case 6: { // Current Frame only
-            result_hdr = current_hdr;
-        }
-        case 7: { // Validity: Green=OK, Red=SpatialInvalid, Blue=TemporalInvalid
-            if (has_valid_history && history_valid_spatial) { result_hdr = vec3f(0.0, 1.0, 0.0); }
-            else if (has_valid_history) { result_hdr = vec3f(1.0, 0.0, 0.0); }
-            else { result_hdr = vec3f(0.0, 0.0, 1.0); }
-        }
-        default: {}
     }
     
     // Final Sanitize

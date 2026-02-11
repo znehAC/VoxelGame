@@ -45,7 +45,7 @@ fn in_bounds(p: vec3i) -> bool {
 
 fn is_opaque_at(p: vec3i) -> bool {
     if !in_bounds(p) { return true; }
-    return (voxels[voxel_idx_i(p)] & 0xFFFFu) != 0u;
+    return (voxels[voxel_idx_i(p)] & 0x3FFFu) != 0u;
 }
 
 fn read_light(p: vec3i) -> vec3f {
@@ -90,7 +90,7 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let packed = voxels[voxel_index(gid)];
-    let material_id = packed & 0xFFFFu;
+    let material_id = packed & 0x3FFFu;
 
     // Palette lookup for emission check
     let pu = material_id % 256u;

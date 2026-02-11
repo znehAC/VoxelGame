@@ -17,7 +17,9 @@ struct GlobalUniforms {
 
 struct VoxelData {
     id: u32,
-    state: u32,
+    level: u32,
+    temperature: u32,
+    variant: u32,
     flags: u32,
 }
 
@@ -59,9 +61,11 @@ const MAX_STEPS: u32 = 256u;
 
 fn unpack_voxel(packed: u32) -> VoxelData {
     return VoxelData(
-        packed & 0xFFFFu,
-        (packed >> 16u) & 0xFFu,
-        (packed >> 24u) & 0xFFu,
+        packed & 0x3FFFu,
+        (packed >> 14u) & 0xFu,
+        (packed >> 18u) & 0xFu,
+        (packed >> 22u) & 0xFu,
+        (packed >> 26u) & 0x3Fu,
     );
 }
 
@@ -77,7 +81,7 @@ fn get_voxel_at(pos: vec3i) -> bool {
     }
     let idx = voxel_index(pos.x, pos.y, pos.z);
     let packed = voxels[idx];
-    return (packed & 0xFFFFu) != 0u;
+    return (packed & 0x3FFFu) != 0u;
 }
 
 fn vertex_ao(side1: f32, side2: f32, corner: f32) -> f32 {
@@ -255,7 +259,7 @@ fn dda_march(origin: vec3f, dir: vec3f) -> HitResult {
 
     // Check starting cell
     var packed = voxels[voxel_index(cell.x, cell.y, cell.z)];
-    if (packed & 0xFFFFu) != 0u {
+    if (packed & 0x3FFFu) != 0u {
         result.hit = true;
         result.pos = entry;
 
@@ -323,7 +327,7 @@ fn dda_march(origin: vec3f, dir: vec3f) -> HitResult {
         }
 
         packed = voxels[voxel_index(cell.x, cell.y, cell.z)];
-        if (packed & 0xFFFFu) != 0u {
+        if (packed & 0x3FFFu) != 0u {
             result.hit = true;
 
             // Compute normal from last axis crossed
@@ -463,11 +467,9 @@ fn shade_pbr(hit: HitResult, dir: vec3f, screen_pos: vec2f) -> vec3f {
 
     // Apply Noise Variation to Albedo
     // Use the voxel integer coordinate to seed the hash for variation.
-    let voxel_pos = floor(hit.pos - dir * 0.001);
-    let noise_val = hash(voxel_pos);
-    
     // Modulate albedo based on noise strength (e.g. stone has high variation).
-    // Modulate albedo based on noise strength (e.g. stone has high variation).
+    // Use the unpacked variant (0-15) to drive the noise.
+    let noise_val = hash(vec3f(f32(hit.voxel.variant), 0.0, 0.0));
     let noise_mod = 1.0 - (noise_strength * noise_val * 0.5);
     let noisy_albedo = albedo * noise_mod;
 

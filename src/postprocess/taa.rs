@@ -61,20 +61,6 @@ pub struct TaaConfig {
     pub use_ycocg: bool,
 }
 
-impl TaaConfig {
-    /// Pack config flags into a u32 for GPU
-    fn packed_flags(&self) -> u32 {
-        let mut flags = 0u32;
-        if self.use_variance_clamp {
-            flags |= 1;
-        }
-        if self.use_ycocg {
-            flags |= 2;
-        }
-        flags
-    }
-}
-
 impl Default for TaaConfig {
     fn default() -> Self {
         TaaPreset::High.config()
@@ -107,7 +93,6 @@ pub struct TaaPipeline {
     height: u32,
     format: wgpu::TextureFormat,
     config: TaaConfig,
-    debug_mode: u32,
 }
 
 impl TaaPipeline {
@@ -288,7 +273,6 @@ impl TaaPipeline {
             height: 1,
             format,
             config,
-            debug_mode: 0,
         };
 
         pipeline.resize(gpu, width, height);
@@ -366,19 +350,10 @@ impl TaaPipeline {
             self.height,
             self.config.blend_alpha,
             self.config.enable_sharpening,
-            self.debug_mode,
             has_valid_history,
             self.config.use_variance_clamp,
             self.config.use_ycocg,
         );
-
-        // Debug output when blend_alpha changes or debug mode is 8
-        if self.debug_mode == 8 || (self.frame_count <= 3 && self.frame_count > 0) {
-            eprintln!(
-                "[TAA Debug] frame={}, blend_alpha={}, debug_mode={}, has_valid_history={}",
-                self.frame_count, uniforms.params.x, uniforms.params.z, has_valid_history
-            );
-        }
 
         queue.write_buffer(&self.uniform_buf, 0, bytemuck::bytes_of(&uniforms));
     }
@@ -398,68 +373,6 @@ impl TaaPipeline {
     pub fn get_current_output_view(&self) -> &wgpu::TextureView {
         // After resolve(), we wrote to (frame + 1) % 2, so that's our output
         &self.target_views[(self.frame_count as usize + 1) % 2]
-    }
-
-    /// Get the current output texture
-    pub fn get_current_output_texture(&self) -> &wgpu::Texture {
-        &self.targets[(self.frame_count as usize + 1) % 2]
-    }
-
-    /// Cycle debug mode
-    pub fn cycle_debug_mode(&mut self, gpu: &GpuContext) {
-        let old_mode = self.debug_mode;
-        self.debug_mode = (self.debug_mode + 1) % 13; // 0-12 debug modes
-
-        // If switching FROM a debug mode (1-6) TO normal mode (0), clear history
-        // because debug visualization colors may have corrupted the history buffer
-        if old_mode != 0 && self.debug_mode == 0 {
-            println!("Clearing TAA history after exiting debug mode...");
-            self.clear_history(gpu);
-            self.frame_count = 0; // Reset frame count to invalidate history
-        }
-
-        // If entering Raw History mode (4), clear history first to get a clean view
-        // This prevents confusion between old corrupted history and actual reprojection
-        if old_mode != 4 && self.debug_mode == 4 {
-            println!("Clearing TAA history for clean Raw History view...");
-            self.clear_history(gpu);
-            self.frame_count = 0;
-        }
-
-        let has_valid_history = self.frame_count >= 2;
-        self.update_uniforms(gpu.queue(), has_valid_history);
-
-        let mode_name = match self.debug_mode {
-            0 => "Normal",
-            1 => "Velocity",
-            2 => "Neighborhood Min",
-            3 => "Neighborhood Max",
-            4 => "Raw History",
-            5 => "Clipped History",
-            6 => "Current Only (no TAA)",
-            7 => "Validity (Green=OK, Red=OOB, Blue=NoHist)",
-            8 => "FORCE BLEND (50/50, ignore valid_history)",
-            9 => "HasValidHistory Flag (Green=True, Red=False)",
-            10 => "HistorySampleValid Flag (Green=True, Red=False)",
-            11 => "ValidHistory Combined (Green=True, Red=False)",
-            12 => "OUTPUT RED (Test if writes work)",
-            _ => "Unknown",
-        };
-        println!("TAA Debug Mode: {} ({})", self.debug_mode, mode_name);
-    }
-
-    /// Set debug mode directly
-    #[allow(dead_code)]
-    pub fn set_debug_mode(&mut self, gpu: &GpuContext, mode: u32) {
-        self.debug_mode = mode;
-        let has_valid_history = self.frame_count >= 2;
-        self.update_uniforms(gpu.queue(), has_valid_history);
-    }
-
-    /// Get current debug mode
-    #[allow(dead_code)]
-    pub fn debug_mode(&self) -> u32 {
-        self.debug_mode
     }
 
     /// Execute TAA resolve pass using ping-pong strategy

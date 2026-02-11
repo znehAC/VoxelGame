@@ -290,7 +290,6 @@ impl TaaUniforms {
         height: u32,
         blend_alpha: f32,
         enable_sharpening: bool,
-        debug_mode: u32,
         has_valid_history: bool,
         use_variance_clamp: bool,
         use_ycocg: bool,
@@ -305,7 +304,7 @@ impl TaaUniforms {
             params: Vec4::new(
                 blend_alpha,
                 if enable_sharpening { 1.0 } else { 0.0 },
-                debug_mode as f32,
+                0.0,
                 if has_valid_history { 1.0 } else { 0.0 },
             ),
             flags: Vec4::new(

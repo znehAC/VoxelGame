@@ -203,10 +203,6 @@ fn fs_edges(in: VertexOutput) -> @location(0) vec4f {
     let final_delta = max(max_delta.x, max_delta.y);
 
     edges = edges * step(vec2f(final_delta), SMAA_LOCAL_CONTRAST_ADAPTATION_FACTOR * delta_xy);
-    
-    if (u.debug_mode == 1u) { return vec4f(in.uv, 0.0, 1.0); }
-    if (u.debug_mode == 2u) { return vec4f(delta_xy * 5.0, 0.0, 1.0); }
-    if (u.debug_mode == 3u) { return vec4f(edges, 0.0, 1.0); }
 
     return vec4f(edges, 0.0, 0.0);
 }
@@ -216,8 +212,6 @@ fn fs_edges(in: VertexOutput) -> @location(0) vec4f {
 fn fs_weights(in: VertexOutput) -> @location(0) vec4f {
     var weights = vec4f(0.0);
     let e = textureSample(t_color, s_linear, in.uv).rg;
-    
-    if (u.debug_mode == 4u) { return vec4f(e, 0.0, 1.0); }
 
     if (e.g > 0.0) {
         var d: vec2f;
@@ -235,9 +229,6 @@ fn fs_weights(in: VertexOutput) -> @location(0) vec4f {
         let e2 = textureSampleLevel(t_color, s_linear, vec2f(coords.z, coords.y), 0.0).r;
         let area = SMAAArea(sqrt_d, e1, e2, 0.0);
         weights = vec4f(area.r, area.g, weights.b, weights.a);
-        
-        if (u.debug_mode == 5u) { return vec4f(vec2f(d) / 16.0, 0.0, 1.0); }
-        if (u.debug_mode == 6u) { return vec4f(weights.rg, 0.0, 1.0); }
     }
 
     if (e.r > 0.0) {
@@ -256,14 +247,6 @@ fn fs_weights(in: VertexOutput) -> @location(0) vec4f {
         let e2 = textureSampleLevel(t_color, s_linear, vec2f(coords.x, coords.z), 0.0).g;
         let area2 = SMAAArea(sqrt_d, e1, e2, 1.0);
         weights = vec4f(weights.r, weights.g, area2.r, area2.g);
-        
-        if (u.debug_mode == 7u && weights.r < 0.01 && weights.g < 0.01) {
-            return vec4f(0.0, weights.b, weights.a, 1.0);
-        }
-    }
-
-    if (u.debug_mode == 8u) {
-        return vec4f(weights.r + weights.b, weights.g + weights.a, max(weights.b, weights.a), 1.0);
     }
 
     return weights;
@@ -272,11 +255,6 @@ fn fs_weights(in: VertexOutput) -> @location(0) vec4f {
 // --- Fragment: Neighborhood Blending ---
 @fragment
 fn fs_blend(in: VertexOutput) -> @location(0) vec4f {
-    if (u.debug_mode == 9u) {
-        let w = textureSample(t_area, s_linear, in.uv);
-        return vec4f(w.r + w.b, w.g + w.a, max(w.b, w.a), 1.0);
-    }
-
     let a_x = textureSample(t_area, s_linear, in.offset0.xy).a;
     let a_y = textureSample(t_area, s_linear, in.offset0.zw).g;
     let a_z = textureSample(t_area, s_linear, in.uv).x;

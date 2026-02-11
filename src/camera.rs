@@ -6,12 +6,6 @@
 use ara_core::glam::{Mat4, Vec2, Vec3};
 use ara_core::{Action, InputManager};
 
-/// Movement speed in units per second.
-const MOVE_SPEED: f32 = 10.0;
-/// Sprint speed multiplier.
-const SPRINT_MULTIPLIER: f32 = 3.0;
-/// Mouse sensitivity (radians per pixel).
-const MOUSE_SENSITIVITY: f32 = 0.002;
 /// Pitch clamp to prevent gimbal lock (radians).
 const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
 
@@ -35,7 +29,6 @@ pub struct HaltonJitter {
 
 impl HaltonJitter {
     /// Create a new Halton jitter generator with specified sample count.
-    #[allow(dead_code)]
     pub fn new(sample_count: usize) -> Self {
         let count = sample_count.clamp(4, HALTON_SEQUENCE.len());
         let sequence: Vec<Vec2> = HALTON_SEQUENCE[..count]
@@ -101,16 +94,32 @@ pub struct FpsCamera {
     jitter: Vec2,
     /// Aspect ratio for projection.
     aspect_ratio: f32,
+    /// Field of view in radians.
+    fov: f32,
+    /// Movement speed in units per second.
+    move_speed: f32,
+    /// Sprint speed multiplier.
+    sprint_multiplier: f32,
+    /// Mouse sensitivity (radians per pixel).
+    mouse_sensitivity: f32,
 }
 
 impl FpsCamera {
-    /// Create a new camera at the origin facing -Z.
-    pub fn new(aspect_ratio: f32) -> Self {
-        let position = Vec3::new(32.0, 62.0, 10.0); // Start above ground
+    /// Create a new camera with specified configuration.
+    pub fn new(
+        aspect_ratio: f32,
+        start_position: [f32; 3],
+        start_pitch: f32,
+        fov: f32,
+        move_speed: f32,
+        sprint_multiplier: f32,
+        mouse_sensitivity: f32,
+    ) -> Self {
+        let position = Vec3::from_array(start_position);
         let yaw = 0.0;
-        let pitch = -0.3; // Looking slightly down
+        let pitch = start_pitch;
 
-        let proj_matrix = Self::create_projection(aspect_ratio);
+        let proj_matrix = Self::build_projection(aspect_ratio, fov);
         let view_matrix = Self::create_view(position, yaw, pitch);
 
         Self {
@@ -121,14 +130,15 @@ impl FpsCamera {
             proj_matrix,
             jitter: Vec2::ZERO,
             aspect_ratio,
+            fov,
+            move_speed,
+            sprint_multiplier,
+            mouse_sensitivity,
         }
     }
 
     /// Create a perspective projection matrix for Vulkan.
-    ///
-    /// Vulkan has Y pointing down in NDC, so we flip Y here.
-    fn create_projection(aspect_ratio: f32) -> Mat4 {
-        let fov_y = std::f32::consts::FRAC_PI_4; // 45 degrees
+    fn build_projection(aspect_ratio: f32, fov_y: f32) -> Mat4 {
         let near = 0.1;
         let far = 1000.0;
 
@@ -171,10 +181,9 @@ impl FpsCamera {
 
     /// Update camera from input state.
     pub fn update(&mut self, input: &mut InputManager, dt: f32) {
-        // Apply mouse look
         let (dx, dy) = input.take_mouse_delta();
-        self.yaw += (dx as f32) * MOUSE_SENSITIVITY;
-        self.pitch -= (dy as f32) * MOUSE_SENSITIVITY; // Invert Y for natural mouse look
+        self.yaw += (dx as f32) * self.mouse_sensitivity;
+        self.pitch -= (dy as f32) * self.mouse_sensitivity;
 
         // Clamp pitch
         self.pitch = self.pitch.clamp(-PITCH_LIMIT, PITCH_LIMIT);
@@ -201,9 +210,9 @@ impl FpsCamera {
             }
 
             let speed = if input.is_active(Action::Sprint) {
-                MOVE_SPEED * SPRINT_MULTIPLIER
+                self.move_speed * self.sprint_multiplier
             } else {
-                MOVE_SPEED
+                self.move_speed
             };
 
             self.position += move_dir * speed * dt;
@@ -223,7 +232,7 @@ impl FpsCamera {
     /// Update aspect ratio (call on window resize).
     pub fn set_aspect_ratio(&mut self, aspect_ratio: f32) {
         self.aspect_ratio = aspect_ratio;
-        self.proj_matrix = Self::create_projection(aspect_ratio);
+        self.proj_matrix = Self::build_projection(aspect_ratio, self.fov);
     }
 
     /// Set the jitter offset for TAA.
@@ -267,7 +276,6 @@ impl FpsCamera {
     }
 
     /// Get the view-projection matrix without jitter.
-    #[allow(dead_code)]
     pub fn view_proj(&self) -> Mat4 {
         self.proj_matrix * self.view_matrix
     }
