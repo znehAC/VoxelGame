@@ -1,6 +1,7 @@
-use wgpu::util::DeviceExt;
 use crate::gpu::GpuContext;
 use bytemuck::{Pod, Zeroable};
+#[allow(unused_imports)]
+use wgpu::util::DeviceExt;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -31,6 +32,7 @@ impl UiBatcher {
         }
     }
 
+    #[allow(dead_code)]
     pub fn clear(&mut self) {
         self.vertices.clear();
         self.indices.clear();
@@ -38,15 +40,39 @@ impl UiBatcher {
 
     pub fn push_rect(&mut self, x: f32, y: f32, w: f32, h: f32, color: [f32; 4]) {
         let start_idx = self.vertices.len() as u16;
-        
-        self.vertices.push(UiVertex { position: [x, y], uv: [0.0, 0.0], color, mode: 1 });
-        self.vertices.push(UiVertex { position: [x + w, y], uv: [1.0, 0.0], color, mode: 1 });
-        self.vertices.push(UiVertex { position: [x + w, y + h], uv: [1.0, 1.0], color, mode: 1 });
-        self.vertices.push(UiVertex { position: [x, y + h], uv: [0.0, 1.0], color, mode: 1 });
+
+        self.vertices.push(UiVertex {
+            position: [x, y],
+            uv: [0.0, 0.0],
+            color,
+            mode: 1,
+        });
+        self.vertices.push(UiVertex {
+            position: [x + w, y],
+            uv: [1.0, 0.0],
+            color,
+            mode: 1,
+        });
+        self.vertices.push(UiVertex {
+            position: [x + w, y + h],
+            uv: [1.0, 1.0],
+            color,
+            mode: 1,
+        });
+        self.vertices.push(UiVertex {
+            position: [x, y + h],
+            uv: [0.0, 1.0],
+            color,
+            mode: 1,
+        });
 
         self.indices.extend_from_slice(&[
-            start_idx, start_idx + 1, start_idx + 2,
-            start_idx, start_idx + 2, start_idx + 3,
+            start_idx,
+            start_idx + 1,
+            start_idx + 2,
+            start_idx,
+            start_idx + 2,
+            start_idx + 3,
         ]);
     }
 
@@ -57,11 +83,13 @@ impl UiBatcher {
 pub struct UiContext {
     pub screen_width: f32,
     pub screen_height: f32,
+    #[allow(dead_code)]
     pub selected_block_name: String,
 }
 
 pub trait UiComponent {
-    fn update(&mut self, _ctx: &UiContext) {}
+    #[allow(unused_variables)]
+    fn update(&mut self, ctx: &UiContext) {}
     fn draw(&self, batch: &mut UiBatcher, ctx: &UiContext);
 }
 
@@ -77,8 +105,20 @@ impl UiComponent for CrosshairComponent {
         let thickness = 2.0;
         let color = [1.0, 1.0, 1.0, 0.8];
 
-        batch.push_rect(cx - size/2.0, cy - thickness/2.0, size, thickness, color);
-        batch.push_rect(cx - thickness/2.0, cy - size/2.0, thickness, size, color);
+        batch.push_rect(
+            cx - size / 2.0,
+            cy - thickness / 2.0,
+            size,
+            thickness,
+            color,
+        );
+        batch.push_rect(
+            cx - thickness / 2.0,
+            cy - size / 2.0,
+            thickness,
+            size,
+            color,
+        );
     }
 }
 
@@ -90,16 +130,12 @@ impl UiComponent for HotbarComponent {
         let h = 50.0;
         let x = (ctx.screen_width - w) / 2.0;
         let y = ctx.screen_height - h - 20.0;
-        
+
         // Background
         batch.push_rect(x, y, w, h, [0.1, 0.1, 0.1, 0.5]);
-        
+
         // Selection Box (just a placeholder visual)
         batch.push_rect(x + 10.0, y + 5.0, 40.0, 40.0, [1.0, 1.0, 1.0, 0.3]);
-        
-        // Selected Block Text Indicator (We don't have font rendering yet, so used colored rect)
-        // Check "selected_block_name" ? We can't render text yet.
-        // Let's draw a small color indicator for now?
     }
 }
 
@@ -117,10 +153,14 @@ pub struct UiSystem {
 
 impl UiSystem {
     pub fn new(gpu: &GpuContext, format: wgpu::TextureFormat) -> Self {
-        let shader = gpu.device().create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("UI Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("../assets/shaders/ui.wgsl"))),
-        });
+        let shader = gpu
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("UI Shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                    "../assets/shaders/ui.wgsl"
+                ))),
+            });
 
         let uniform_size = std::mem::size_of::<UiUniforms>() as u64;
         let uniform_buffer = gpu.device().create_buffer(&wgpu::BufferDescriptor {
@@ -133,7 +173,11 @@ impl UiSystem {
         // Dummy texture for now (1x1 white) to satisfy binding
         let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
             label: Some("UI Dummy Texture"),
-            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -141,21 +185,25 @@ impl UiSystem {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        
+
         gpu.queue().write_texture(
-             wgpu::TexelCopyTextureInfo {
-                 texture: &texture,
-                 mip_level: 0,
-                 origin: wgpu::Origin3d::ZERO,
-                 aspect: wgpu::TextureAspect::All,
-             },
-             &[255, 255, 255, 255],
-             wgpu::TexelCopyBufferLayout {
-                 offset: 0,
-                 bytes_per_row: Some(4),
-                 rows_per_image: Some(1),
-             },
-             wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 }
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &[255, 255, 255, 255],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4),
+                rows_per_image: Some(1),
+            },
+            wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
         );
 
         let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -165,91 +213,122 @@ impl UiSystem {
             ..Default::default()
         });
 
-        let bind_group_layout = gpu.device().create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("UI Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+        let bind_group_layout =
+            gpu.device()
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("UI Bind Group Layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
 
         let bind_group = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("UI Bind Group"),
             layout: &bind_group_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&texture_view) },
-                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
             ],
         });
 
-        let layout = gpu.device().create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("UI Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
+        let layout = gpu
+            .device()
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("UI Pipeline Layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
 
-        let pipeline = gpu.device().create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("UI Pipeline"),
-            layout: Some(&layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<UiVertex>() as wgpu::BufferAddress,
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 0, shader_location: 0 },
-                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 8, shader_location: 1 },
-                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 16, shader_location: 2 },
-                        wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: 32, shader_location: 3 },
-                    ],
-                }],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let pipeline = gpu
+            .device()
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("UI Pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<UiVertex>() as wgpu::BufferAddress,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 8,
+                                shader_location: 1,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 16,
+                                shader_location: 2,
+                            },
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Uint32,
+                                offset: 32,
+                                shader_location: 3,
+                            },
+                        ],
+                    }],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
 
         // Initial buffers (dynamically resized later if needed, but for now fixed size is easier)
         let vertex_capacity = 1024;
@@ -269,10 +348,8 @@ impl UiSystem {
             mapped_at_creation: false,
         });
 
-        let components: Vec<Box<dyn UiComponent>> = vec![
-            Box::new(CrosshairComponent),
-            Box::new(HotbarComponent),
-        ];
+        let components: Vec<Box<dyn UiComponent>> =
+            vec![Box::new(CrosshairComponent), Box::new(HotbarComponent)];
 
         Self {
             pipeline,
@@ -291,12 +368,19 @@ impl UiSystem {
             screen_size: [width as f32, height as f32],
             pad: [0.0, 0.0],
         };
-        gpu.queue().write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        gpu.queue()
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }
 
-    pub fn render(&mut self, gpu: &GpuContext, view: &wgpu::TextureView, encoder: &mut wgpu::CommandEncoder, ctx: &UiContext) {
+    pub fn render(
+        &mut self,
+        gpu: &GpuContext,
+        view: &wgpu::TextureView,
+        encoder: &mut wgpu::CommandEncoder,
+        ctx: &UiContext,
+    ) {
         let mut batch = UiBatcher::new();
-        
+
         for comp in &self.components {
             comp.draw(&mut batch, ctx);
         }
@@ -310,11 +394,12 @@ impl UiSystem {
         let v_bytes = bytemuck::cast_slice(&batch.vertices);
         let i_bytes = bytemuck::cast_slice(&batch.indices);
 
-        if batch.vertices.len() > self.vertex_capacity || batch.indices.len() > self.index_capacity {
-             eprintln!("UI Batch overflow! Increase capacity.");
-             // For now, just truncate or return to avoid crash
+        if batch.vertices.len() > self.vertex_capacity || batch.indices.len() > self.index_capacity
+        {
+            eprintln!("UI Batch overflow! Increase capacity.");
+            // For now, just truncate or return to avoid crash
         }
-        
+
         gpu.queue().write_buffer(&self.vertex_buffer, 0, v_bytes);
         gpu.queue().write_buffer(&self.index_buffer, 0, i_bytes);
 

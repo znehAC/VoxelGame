@@ -1,12 +1,19 @@
 //! Presentation layer: fullscreen-quad pipeline with palette texture, voxel SSBO, and uniforms.
 
-use ara_core::{bytemuck, GlobalUniforms, LightBuffer, PackedVoxel, PointLight};
+use ara_core::{bytemuck, GlobalUniforms, LightBuffer, PackedVoxel};
 
 use crate::assets;
 use crate::gpu::GpuContext;
 use crate::light::LightPropagation;
-use crate::postprocess::BloomPipeline;
+use crate::postprocess::{BloomPipeline, FxaaPipeline, SmaaPipeline, SmaaPreset};
 use crate::ui::{UiContext, UiSystem};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AaMode {
+    None,
+    Fxaa,
+    Smaa,
+}
 
 /// Manages surface presentation with palette-texture + voxel-SSBO pipeline.
 pub struct Renderer {
@@ -20,7 +27,13 @@ pub struct Renderer {
     palette_tex: wgpu::Texture,
     light: LightPropagation,
     post_process: BloomPipeline,
+    fxaa: FxaaPipeline,
+    smaa: SmaaPipeline,
+    final_sdr_texture: wgpu::Texture,
+    final_sdr_view: wgpu::TextureView,
     ui_system: UiSystem,
+    pub aa_mode: AaMode,
+    pub smaa_debug_mode: u32,
 }
 
 impl Renderer {
@@ -55,6 +68,29 @@ impl Renderer {
 
         // Initialize Bloom Pipeline
         let post_process = BloomPipeline::new(gpu, width, height, format);
+
+        // Initialize FXAA Pipeline
+        let fxaa = FxaaPipeline::new(gpu.device(), &config);
+        
+        // Initialize SMAA Pipeline
+        let smaa = SmaaPipeline::new(gpu, width, height, format, SmaaPreset::High);
+
+        // Initialize Final SDR Texture (Input for AA)
+        let final_sdr_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("Final SDR Texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let final_sdr_view = final_sdr_texture.create_view(&Default::default());
 
         // Initialize UI System
         let ui_system = UiSystem::new(gpu, format);
@@ -308,7 +344,13 @@ impl Renderer {
             palette_tex,
             light,
             post_process,
+            fxaa,
+            smaa,
+            final_sdr_texture,
+            final_sdr_view,
             ui_system,
+            aa_mode: AaMode::Smaa, // Default to SMAA
+            smaa_debug_mode: 0,
         }
     }
 
@@ -321,7 +363,49 @@ impl Renderer {
         self.config.height = height;
         self.surface.configure(gpu.device(), &self.config);
         self.post_process.resize(gpu, width, height);
+        self.fxaa.resize(gpu.queue(), width, height);
+        self.smaa.resize(gpu, width, height);
+
+        // Recreate final SDR texture
+        self.final_sdr_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
+            label: Some("Final SDR Texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        self.final_sdr_view = self.final_sdr_texture.create_view(&Default::default());
+
         self.ui_system.resize(gpu, width, height);
+    }
+
+    /// Cycle SMAA Debug Mode
+    /// 0=Normal, 1=UVs, 2=Edge Deltas, 3=Edge Threshold, 4=Edges Input, 5=Search Dist, 
+    /// 6=Area Horiz, 7=Area Vert, 8=Weights Combined, 9=Final Weights
+    pub fn cycle_smaa_debug(&mut self, gpu: &GpuContext) {
+        self.smaa_debug_mode = (self.smaa_debug_mode + 1) % 10;
+        self.smaa.set_debug_mode(gpu.queue(), self.smaa_debug_mode);
+        let mode_name = match self.smaa_debug_mode {
+            0 => "Normal",
+            1 => "UV Test (gradient)",
+            2 => "Edge Deltas (20x boost)",
+            3 => "Edge Threshold Result",
+            4 => "Edges Input to Weights Pass",
+            5 => "Search Distances",
+            6 => "Area Weights (Horizontal)",
+            7 => "Area Weights (Vertical)",
+            8 => "Combined Weights",
+            9 => "Final Blend Weights",
+            _ => "Unknown",
+        };
+        println!("SMAA Debug Mode: {} ({})", self.smaa_debug_mode, mode_name);
     }
 
     /// Render a frame: upload uniforms, draw fullscreen quad.
@@ -372,8 +456,24 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
 
-        // Run Bloom + Tone Mapping -> Swapchain
-        self.post_process.render(gpu.device(), &mut encoder, &view);
+        match self.aa_mode {
+            AaMode::Fxaa => {
+                // Bloom -> Final SDR (Intermediate)
+                self.post_process.render(gpu.device(), &mut encoder, &self.final_sdr_view);
+                // FXAA -> Screen
+                self.fxaa.render(gpu.device(), &mut encoder, &self.final_sdr_view, &view);
+            },
+            AaMode::Smaa => {
+                // Bloom -> Final SDR (Intermediate)
+                self.post_process.render(gpu.device(), &mut encoder, &self.final_sdr_view);
+                // SMAA -> Screen
+                self.smaa.render(gpu.device(), &mut encoder, &self.final_sdr_view, &view);
+            },
+            AaMode::None => {
+                // Bloom -> Screen (Direct)
+                self.post_process.render(gpu.device(), &mut encoder, &view);
+            }
+        }
 
         // Render UI on top
         self.ui_system.render(gpu, &view, &mut encoder, ui_ctx);

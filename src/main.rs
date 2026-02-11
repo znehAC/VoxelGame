@@ -26,7 +26,7 @@ use ara_core::{
 use ara_core::glam;
 use camera::FpsCamera;
 use gpu::GpuContext;
-use renderer::Renderer;
+use renderer::{Renderer, AaMode};
 
 const WINDOW_TITLE: &str = "Turi";
 const INITIAL_WIDTH: u32 = 1280;
@@ -251,6 +251,27 @@ impl ApplicationHandler for App {
                             }
                             Err(e) => eprintln!("Failed to reload assets: {e}"),
                         }
+                    }
+                    return;
+                }
+
+                // F2: Cycle Anti-Aliasing Mode
+                if key == KeyCode::F2 && state == ElementState::Pressed {
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.aa_mode = match renderer.aa_mode {
+                            AaMode::None => AaMode::Fxaa,
+                            AaMode::Fxaa => AaMode::Smaa,
+                            AaMode::Smaa => AaMode::None,
+                        };
+                        println!("Anti-Aliasing Mode: {:?}", renderer.aa_mode);
+                    }
+                    return;
+                }
+
+                // F4: Cycle SMAA Debug Mode
+                if key == KeyCode::F4 && state == ElementState::Pressed {
+                    if let (Some(renderer), Some(gpu)) = (&mut self.renderer, &self.gpu) {
+                        renderer.cycle_smaa_debug(gpu);
                     }
                     return;
                 }
