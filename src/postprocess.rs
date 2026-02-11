@@ -3,12 +3,15 @@ use ara_core::bytemuck;
 use crate::gpu::GpuContext;
 
 pub mod smaa;
-pub use smaa::{SmaaPipeline, SmaaPreset, SmaaConfig};
+pub use smaa::{SmaaPipeline, SmaaPreset};
+
+pub mod taa;
+pub use taa::{TaaPipeline, TaaPreset};
 
 /// A generic fullscreen shader pass.
 pub struct FullscreenPass {
-    pipeline: wgpu::RenderPipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) pipeline: wgpu::RenderPipeline,
+    pub(crate) bind_group_layout: wgpu::BindGroupLayout,
 }
 
 impl FullscreenPass {
@@ -98,22 +101,22 @@ impl FullscreenPass {
 }
 
 pub struct BloomPipeline {
-    threshold_pass: FullscreenPass,
-    blur_pass: FullscreenPass,
-    composite_pipeline: wgpu::RenderPipeline,
-    composite_bind_group_layout: wgpu::BindGroupLayout,
+    pub(crate) threshold_pass: FullscreenPass,
+    pub(crate) blur_pass: FullscreenPass,
+    pub(crate) composite_pipeline: wgpu::RenderPipeline,
+    pub(crate) composite_bind_group_layout: wgpu::BindGroupLayout,
 
-    sampler: wgpu::Sampler,
+    pub(crate) sampler: wgpu::Sampler,
 
     // Intermediate textures
     hdr_texture: wgpu::Texture,
     hdr_view: wgpu::TextureView,
 
-    bloom_texture: wgpu::Texture,
-    bloom_view: wgpu::TextureView,
+    pub(crate) bloom_texture: wgpu::Texture,
+    pub(crate) bloom_view: wgpu::TextureView,
 
-    blur_temp_texture: wgpu::Texture,
-    blur_temp_view: wgpu::TextureView,
+    pub(crate) blur_temp_texture: wgpu::Texture,
+    pub(crate) blur_temp_view: wgpu::TextureView,
 }
 
 impl BloomPipeline {
@@ -524,6 +527,10 @@ impl BloomPipeline {
     pub fn hdr_view(&self) -> &wgpu::TextureView {
         &self.hdr_view
     }
+    
+    pub fn hdr_texture(&self) -> &wgpu::Texture {
+        &self.hdr_texture
+    }
 }
 
 fn create_texture(
@@ -544,7 +551,10 @@ fn create_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_DST
+            | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     })
 }

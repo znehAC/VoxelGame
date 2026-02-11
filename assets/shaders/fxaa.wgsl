@@ -14,23 +14,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
         f32(vertex_index & 2u)
     );
     let position = vec4f(uv * 2.0 - 1.0, 0.0, 1.0);
-    // Invert Y for WGPU if needed, but standard UV (0,0 top-left) works if we sample consistently.
-    // WGPU clip space is Y up, UVs are Y down usually.
-    // Let's stick to standard full screen triangle UVs: (0,0) to (2,2) -> (0,0) to (1,1) visible.
-    // Screen coords: (-1, -1) to (3, 3).
-    // Visible quad: (-1, -1) to (1, 1).
-    // UVs: (0, 1) bottom-left, (2, 1) bottom-right, (0, -1) top-left... wait.
-    
-    // Standard approach:
-    // 0: (-1, -1), uv (0, 1) -> Bottom Left
-    // 1: ( 3, -1), uv (2, 1) -> Bottom Right
-    // 2: (-1,  3), uv (0, -1) -> Top Left
-    // WGPU Texture coords: (0,0) is Top-Left.
-    // WGPU Clip Space: (-1, -1) is Bottom-Left.
-    
-    // Let's use the logic from existing shaders if available, or standard:
-    // positions: (-1, 1), (3, 1), (-1, -3) -> UVs (0,0), (2,0), (0,2) ?
-    
+
     var out: VertexOutput;
     out.uv = vec2f(f32((vertex_index << 1u) & 2u), f32(vertex_index & 2u));
     out.position = vec4f(out.uv * vec2f(2.0, -2.0) + vec2f(-1.0, 1.0), 0.0, 1.0);
@@ -44,7 +28,7 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 // FXAA Constants
 const FXAA_EDGE_THRESHOLD: f32 = 0.0625; // Lower = more edges detected
 const FXAA_EDGE_THRESHOLD_MIN: f32 = 0.0312;
-const FXAA_SUBPIX_TRIM: f32 = 1.0/8.0; // Lower = start blending on lower contrast sub-pixels
+const FXAA_SUBPIX_TRIM: f32 = 1.0/6.0; // Lower = start blending on lower contrast sub-pixels
 const FXAA_SUBPIX_TRIM_SCALE: f32 = 1.0/(1.0 - FXAA_SUBPIX_TRIM);
 const FXAA_SUBPIX_CAP: f32 = 0.875; // Higher = more blur on sub-pixels
 const FXAA_SEARCH_STEPS: i32 = 12; // Maximum search steps
@@ -73,7 +57,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     // Early exit if contrast is too low
     if (contrast < max(FXAA_EDGE_THRESHOLD_MIN, maxLuma * FXAA_EDGE_THRESHOLD)) {
         return vec4f(rgbM, 1.0); // Normal render for non-edges
-        // return vec4f(0.0, 1.0, 0.0, 1.0); // DEBUG: Green for skipped pixels
     }
     
     // 2. Edge Direction

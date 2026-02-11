@@ -4,7 +4,7 @@
 //! All types use Vec4 instead of Vec3 to avoid padding issues.
 
 use bytemuck::{Pod, Zeroable};
-use glam::{UVec4, Vec4};
+use glam::{Mat4, UVec4, Vec4};
 
 /// Global uniforms for raymarching.
 ///
@@ -34,6 +34,12 @@ pub struct GlobalUniforms {
     pub ground_color: Vec4,
     /// Selected block position (.xyz = integer coords) + active flag (.w > 0.5 = active).
     pub selected_block: Vec4,
+    /// Previous frame's view-projection matrix (for TAA velocity calculation).
+    /// Column-major, stored as 4 Vec4s.
+    pub prev_view_proj: [Vec4; 4],
+    /// Current frame's view-projection matrix (for TAA velocity calculation).
+    /// Column-major, stored as 4 Vec4s.
+    pub curr_view_proj: [Vec4; 4],
 }
 
 impl GlobalUniforms {
@@ -52,6 +58,43 @@ impl GlobalUniforms {
         ground_color: [f32; 3],
         sun_shadow_max: f32,
         selected_block: Option<[i32; 3]>,
+    ) -> Self {
+        Self::with_view_proj(
+            view_inverse,
+            proj_inverse,
+            cam_pos,
+            time,
+            resolution,
+            sun_dir,
+            sun_intensity,
+            sun_color,
+            sky_color,
+            sky_intensity,
+            ground_color,
+            sun_shadow_max,
+            selected_block,
+            Mat4::IDENTITY.to_cols_array_2d(),
+            Mat4::IDENTITY.to_cols_array_2d(),
+        )
+    }
+
+    /// Create new global uniforms with previous/current view-projection matrices (for TAA).
+    pub fn with_view_proj(
+        view_inverse: [[f32; 4]; 4],
+        proj_inverse: [[f32; 4]; 4],
+        cam_pos: [f32; 3],
+        time: f32,
+        resolution: [f32; 2],
+        sun_dir: [f32; 3],
+        sun_intensity: f32,
+        sun_color: [f32; 3],
+        sky_color: [f32; 3],
+        sky_intensity: f32,
+        ground_color: [f32; 3],
+        sun_shadow_max: f32,
+        selected_block: Option<[i32; 3]>,
+        prev_view_proj: [[f32; 4]; 4],
+        curr_view_proj: [[f32; 4]; 4],
     ) -> Self {
         let sd = glam::Vec3::from_array(sun_dir).normalize_or_zero();
         Self {
@@ -80,6 +123,18 @@ impl GlobalUniforms {
             } else {
                 Vec4::new(0.0, 0.0, 0.0, 0.0)
             },
+            prev_view_proj: [
+                Vec4::from_array(prev_view_proj[0]),
+                Vec4::from_array(prev_view_proj[1]),
+                Vec4::from_array(prev_view_proj[2]),
+                Vec4::from_array(prev_view_proj[3]),
+            ],
+            curr_view_proj: [
+                Vec4::from_array(curr_view_proj[0]),
+                Vec4::from_array(curr_view_proj[1]),
+                Vec4::from_array(curr_view_proj[2]),
+                Vec4::from_array(curr_view_proj[3]),
+            ],
         }
     }
 }
@@ -92,9 +147,9 @@ impl GlobalUniforms {
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct CameraPushConstants {
     /// Inverse view matrix (Camera -> World), column-major.
-    pub view_inverse: [Vec4; 4],   // 64 bytes
+    pub view_inverse: [Vec4; 4], // 64 bytes
     /// Inverse projection matrix (Screen -> Camera), column-major.
-    pub proj_inverse: [Vec4; 4],   // 64 bytes
+    pub proj_inverse: [Vec4; 4], // 64 bytes
 }
 
 impl CameraPushConstants {
@@ -214,6 +269,55 @@ pub struct LightBuffer {
     pub lights: [PointLight; 16],
 }
 
+/// TAA Uniforms for the TAA resolve shader.
+/// Matches the WGSL struct layout exactly (4 vec4s = 64 bytes).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+pub struct TaaUniforms {
+    /// (1.0 / width, 1.0 / height, width, height)
+    pub screen_size: Vec4,
+    /// (blend_alpha, enable_sharpening, debug_mode, has_valid_history)
+    pub params: Vec4,
+    /// (use_variance_clamp, use_ycocg, 0, 0)
+    pub flags: Vec4,
+    /// Padding to ensure 16-byte alignment
+    pub _padding: Vec4,
+}
+
+impl TaaUniforms {
+    pub fn new(
+        width: u32,
+        height: u32,
+        blend_alpha: f32,
+        enable_sharpening: bool,
+        debug_mode: u32,
+        has_valid_history: bool,
+        use_variance_clamp: bool,
+        use_ycocg: bool,
+    ) -> Self {
+        Self {
+            screen_size: Vec4::new(
+                1.0 / width as f32,
+                1.0 / height as f32,
+                width as f32,
+                height as f32,
+            ),
+            params: Vec4::new(
+                blend_alpha,
+                if enable_sharpening { 1.0 } else { 0.0 },
+                debug_mode as f32,
+                if has_valid_history { 1.0 } else { 0.0 },
+            ),
+            flags: Vec4::new(
+                if use_variance_clamp { 1.0 } else { 0.0 },
+                if use_ycocg { 1.0 } else { 0.0 },
+                0.0,
+                0.0,
+            ),
+            _padding: Vec4::ZERO,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -222,9 +326,10 @@ mod tests {
 
     #[test]
     fn global_uniforms_layout() {
-        // view_inverse (64) + proj_inverse (64) + cam_pos (16) + time+resolution+padding (16)
-        // + sun_dir (16) + sun_color (16) + sky_color (16) + ground_color (16) + selected_block (16) = 240
-        assert_eq!(size_of::<GlobalUniforms>(), 240);
+        // view_inverse (64) + proj_inverse (64) + cam_pos (16) + time+resolution+sun_shadow_max (16)
+        // + sun_dir (16) + sun_color (16) + sky_color (16) + ground_color (16) + selected_block (16)
+        // + prev_view_proj (64) + curr_view_proj (64) = 368
+        assert_eq!(size_of::<GlobalUniforms>(), 368);
         assert_eq!(align_of::<GlobalUniforms>(), 16);
     }
 
@@ -242,5 +347,11 @@ mod tests {
         assert_eq!(size_of::<LightBuffer>(), 16 + 16 * 48);
         assert_eq!(align_of::<LightBuffer>(), 16);
     }
-}
 
+    #[test]
+    fn taa_uniforms_layout() {
+        // 4 vec4s = 64 bytes
+        assert_eq!(size_of::<TaaUniforms>(), 64);
+        assert_eq!(align_of::<TaaUniforms>(), 16);
+    }
+}

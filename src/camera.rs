@@ -3,7 +3,7 @@
 //! Uses standard game coordinates: Y-up, -Z forward.
 //! Vulkan's Y-flip is handled in the projection matrix.
 
-use ara_core::glam::{Mat4, Vec3};
+use ara_core::glam::{Mat4, Vec2, Vec3};
 use ara_core::{Action, InputManager};
 
 /// Movement speed in units per second.
@@ -14,6 +14,74 @@ const SPRINT_MULTIPLIER: f32 = 3.0;
 const MOUSE_SENSITIVITY: f32 = 0.002;
 /// Pitch clamp to prevent gimbal lock (radians).
 const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.01;
+
+/// Halton(2,3) sequence for sub-pixel jitter.
+const HALTON_SEQUENCE: [(f32, f32); 8] = [
+    (0.5, 0.333333),
+    (0.25, 0.666667),
+    (0.75, 0.111111),
+    (0.125, 0.444444),
+    (0.625, 0.777778),
+    (0.375, 0.222222),
+    (0.875, 0.555556),
+    (0.0625, 0.888889),
+];
+
+/// Halton sequence generator for TAA jitter.
+pub struct HaltonJitter {
+    sequence: Vec<Vec2>,
+    index: usize,
+}
+
+impl HaltonJitter {
+    /// Create a new Halton jitter generator with specified sample count.
+    #[allow(dead_code)]
+    pub fn new(sample_count: usize) -> Self {
+        let count = sample_count.clamp(4, HALTON_SEQUENCE.len());
+        let sequence: Vec<Vec2> = HALTON_SEQUENCE[..count]
+            .iter()
+            .map(|(x, y)| Vec2::new(*x - 0.5, *y - 0.5))
+            .collect();
+        Self { sequence, index: 0 }
+    }
+
+    /// Get the next jitter offset (sub-pixel, in screen space [-0.5, 0.5]).
+    pub fn next(&mut self) -> Vec2 {
+        let jitter = self.sequence[self.index];
+        self.index = (self.index + 1) % self.sequence.len();
+        jitter
+    }
+
+    /// Reset the sequence to the beginning.
+    #[allow(dead_code)]
+    pub fn reset(&mut self) {
+        self.index = 0;
+    }
+
+    /// Get current jitter without advancing.
+    #[allow(dead_code)]
+    pub fn current(&self) -> Vec2 {
+        self.sequence[self.index]
+    }
+
+    /// Get the length of the sequence.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.sequence.len()
+    }
+
+    /// Check if sequence is empty.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.sequence.is_empty()
+    }
+}
+
+impl Default for HaltonJitter {
+    fn default() -> Self {
+        Self::new(8)
+    }
+}
 
 /// First-person camera with mouse look and movement.
 ///
@@ -27,8 +95,12 @@ pub struct FpsCamera {
     pub pitch: f32,
     /// Cached view matrix.
     view_matrix: Mat4,
-    /// Cached projection matrix.
+    /// Cached projection matrix (without jitter).
     proj_matrix: Mat4,
+    /// Current jitter offset in pixel space.
+    jitter: Vec2,
+    /// Aspect ratio for projection.
+    aspect_ratio: f32,
 }
 
 impl FpsCamera {
@@ -47,6 +119,8 @@ impl FpsCamera {
             pitch,
             view_matrix,
             proj_matrix,
+            jitter: Vec2::ZERO,
+            aspect_ratio,
         }
     }
 
@@ -61,6 +135,17 @@ impl FpsCamera {
         let mut proj = Mat4::perspective_rh(fov_y, aspect_ratio, near, far);
         // Flip Y for Vulkan's NDC (Y-down in clip space)
         proj.y_axis.y *= -1.0;
+        proj
+    }
+
+    /// Apply sub-pixel jitter to projection matrix.
+    ///
+    /// `jitter` is in pixel offset (typically [-0.5, 0.5] range).
+    /// Converts to NDC offset: jitter / screen_size * 2.0
+    fn create_jittered_projection(base_proj: Mat4, jitter: Vec2, width: f32, height: f32) -> Mat4 {
+        let mut proj = base_proj;
+        proj.z_axis.x += (jitter.x * 2.0) / width;
+        proj.z_axis.y += (jitter.y * 2.0) / height;
         proj
     }
 
@@ -137,20 +222,59 @@ impl FpsCamera {
 
     /// Update aspect ratio (call on window resize).
     pub fn set_aspect_ratio(&mut self, aspect_ratio: f32) {
+        self.aspect_ratio = aspect_ratio;
         self.proj_matrix = Self::create_projection(aspect_ratio);
     }
 
+    /// Set the jitter offset for TAA.
+    ///
+    /// `jitter` is typically in range [-0.5, 0.5] in pixel space.
+    pub fn set_jitter(&mut self, jitter: Vec2) {
+        self.jitter = jitter;
+    }
 
+    /// Get the current jitter offset.
+    #[allow(dead_code)]
+    pub fn jitter(&self) -> Vec2 {
+        self.jitter
+    }
 
     /// Get the inverse view matrix (Camera -> World transform).
     pub fn view_inverse(&self) -> Mat4 {
         self.view_matrix.inverse()
     }
 
-    /// Get the inverse projection matrix (Screen -> Camera).
+    /// Get the inverse projection matrix (Screen -> Camera) without jitter.
+    #[allow(dead_code)]
     pub fn proj_inverse(&self) -> Mat4 {
         self.proj_matrix.inverse()
     }
 
+    /// Get the inverse projection matrix with jitter applied.
+    ///
+    /// This is used for unprojecting screen coordinates to world space.
+    pub fn proj_inverse_jittered(&self, width: f32, height: f32) -> Mat4 {
+        let jittered_proj =
+            Self::create_jittered_projection(self.proj_matrix, self.jitter, width, height);
+        jittered_proj.inverse()
+    }
 
+    /// Get the jittered projection matrix.
+    ///
+    /// Used for rendering with TAA.
+    pub fn proj_jittered(&self, width: f32, height: f32) -> Mat4 {
+        Self::create_jittered_projection(self.proj_matrix, self.jitter, width, height)
+    }
+
+    /// Get the view-projection matrix without jitter.
+    #[allow(dead_code)]
+    pub fn view_proj(&self) -> Mat4 {
+        self.proj_matrix * self.view_matrix
+    }
+
+    /// Get the jittered view-projection matrix.
+    pub fn view_proj_jittered(&self, width: f32, height: f32) -> Mat4 {
+        let jittered_proj = self.proj_jittered(width, height);
+        jittered_proj * self.view_matrix
+    }
 }

@@ -8,6 +8,7 @@ const SEARCH_TEX_BYTES: &[u8] = include_bytes!("../../assets/smaa/SearchTex.bin"
 
 /// SMAA Quality Presets
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum SmaaPreset {
     /// 60% quality - fastest
     Low,
@@ -48,6 +49,7 @@ impl SmaaPreset {
 
 /// SMAA Configuration Parameters
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct SmaaConfig {
     /// Edge detection threshold (0.05 - 0.15)
     pub threshold: f32,
@@ -111,6 +113,7 @@ pub struct SmaaPipeline {
     width: u32,
     height: u32,
     debug_mode: u32,
+    #[allow(dead_code)]
     config: SmaaConfig,
 }
 
@@ -442,7 +445,7 @@ impl SmaaPipeline {
             cache: None,
         });
 
-        let mut pipeline = Self {
+        let pipeline = Self {
             edges_pipeline,
             weights_pipeline,
             blend_pipeline,
@@ -546,11 +549,13 @@ impl SmaaPipeline {
     }
 
     /// Get current configuration
+    #[allow(dead_code)]
     pub fn config(&self) -> &SmaaConfig {
         &self.config
     }
 
     /// Get current preset (approximate)
+    #[allow(dead_code)]
     pub fn preset(&self) -> SmaaPreset {
         match (self.config.threshold, self.config.max_search_steps) {
             (0.15, 4) => SmaaPreset::Low,

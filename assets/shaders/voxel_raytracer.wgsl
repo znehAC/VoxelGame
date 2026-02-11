@@ -11,6 +11,8 @@ struct GlobalUniforms {
     sky_color: vec4f,
     ground_color: vec4f,
     selected_block: vec4f, // xyz = pos, w = active (1.0) or inactive (0.0)
+    prev_view_proj: mat4x4f,
+    curr_view_proj: mat4x4f,
 }
 
 struct VoxelData {
@@ -574,8 +576,35 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
+/// Calculate per-pixel velocity for TAA.
+/// Returns velocity in UV space: (current_uv - previous_uv)
+fn calculate_velocity(world_pos: vec3f) -> vec2f {
+    // Transform to clip space
+    let prev_clip = globals.prev_view_proj * vec4f(world_pos, 1.0);
+    let curr_clip = globals.curr_view_proj * vec4f(world_pos, 1.0);
+    
+    // Perspective divide to NDC
+    let prev_ndc = prev_clip.xy / prev_clip.w;
+    let curr_ndc = curr_clip.xy / curr_clip.w;
+    
+    // NDC to UV: [-1, 1] -> [0, 1]
+    // WGPU Abstract Clip Space is Y-up. Texture space is Y-down.
+    // So we need to flip Y.
+    
+    let prev_uv = vec2f(prev_ndc.x, -prev_ndc.y) * 0.5 + 0.5;
+    let curr_uv = vec2f(curr_ndc.x, -curr_ndc.y) * 0.5 + 0.5;
+    
+    // Velocity: where is the pixel NOW minus where was it BEFORE
+    return (curr_uv - prev_uv);
+}
+
+struct FragmentOutput {
+    @location(0) color: vec4f,
+    @location(1) velocity: vec2f,
+}
+
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4f {
+fn fs_main(in: VertexOutput) -> FragmentOutput {
     // NDC → clip → camera space via inverse projection
     let clip = vec4f(in.ndc.x, in.ndc.y, 1.0, 1.0);
     let cam_space = globals.proj_inverse * clip;
@@ -589,11 +618,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4f {
     let hit = dda_march(origin, dir);
 
     var color: vec3f;
+    var world_pos: vec3f;
+    var velocity = vec2f(0.0);
+    
     if hit.hit {
         color = shade_pbr(hit, dir, in.position.xy);
+        // Position for velocity calculation (slightly offset from surface)
+        world_pos = hit.pos + hit.normal * 0.01;
+        velocity = calculate_velocity(world_pos);
     } else {
         color = sky(dir);
+        // Sky is at infinity / static relative to camera translation.
+        // TAA should not reproject sky based on translation.
+        velocity = vec2f(0.0);
     }
 
-    return vec4f(color, 1.0);
+    return FragmentOutput(vec4f(color, 1.0), velocity);
 }

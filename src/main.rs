@@ -19,19 +19,18 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use ara_core::{
-    dda_raycast, Action, BlockRegistry, GlobalUniforms, InputManager, LightBuffer, PackedVoxel,
-    PointLight, GRID_SIZE,
-};
 use ara_core::glam;
-use camera::FpsCamera;
+use ara_core::{
+    Action, BlockRegistry, GRID_SIZE, GlobalUniforms, InputManager, LightBuffer, PackedVoxel,
+    PointLight, dda_raycast,
+};
+use camera::{FpsCamera, HaltonJitter};
 use gpu::GpuContext;
-use renderer::{Renderer, AaMode};
+use renderer::{AaMode, Renderer};
 
 const WINDOW_TITLE: &str = "Turi";
 const INITIAL_WIDTH: u32 = 1280;
 const INITIAL_HEIGHT: u32 = 720;
-
 
 /// Create an InputManager with default WASD + Space/C/Shift bindings.
 fn default_input_bindings() -> InputManager {
@@ -61,10 +60,10 @@ fn generate_room_scene() -> Vec<PackedVoxel> {
         for x in 0..size {
             for y in 0..size {
                 let idx = z * size * size + y * size + x;
-                
+
                 // Floor (Checkerboard)
                 if y == ground_y && x >= min_xz && x <= max_xz && z >= min_xz && z <= max_xz {
-                     // Stone (1) / Grass (3) checkerboard
+                    // Stone (1) / Grass (3) checkerboard
                     let mat = if (x + z) % 2 == 0 { 1u16 } else { 3u16 };
                     voxels[idx] = PackedVoxel::new(mat);
                     continue;
@@ -80,8 +79,10 @@ fn generate_room_scene() -> Vec<PackedVoxel> {
                 if y > ground_y && y < ceiling_y {
                     let is_wall_x = x == min_xz || x == max_xz;
                     let is_wall_z = z == min_xz || z == max_xz;
-                    
-                    if (is_wall_x && z >= min_xz && z <= max_xz) || (is_wall_z && x >= min_xz && x <= max_xz) {
+
+                    if (is_wall_x && z >= min_xz && z <= max_xz)
+                        || (is_wall_z && x >= min_xz && x <= max_xz)
+                    {
                         voxels[idx] = PackedVoxel::new(1); // Stone
                         continue;
                     }
@@ -89,12 +90,12 @@ fn generate_room_scene() -> Vec<PackedVoxel> {
             }
         }
     }
-    
+
     // Add some random pillars inside
-    for y in ground_y+1..ground_y+5 {
+    for y in ground_y + 1..ground_y + 5 {
         let idx1 = 20 * size * size + y * size + 20;
         voxels[idx1] = PackedVoxel::new(2); // Dirt
-        
+
         let idx2 = 40 * size * size + y * size + 40;
         voxels[idx2] = PackedVoxel::new(2); // Dirt
     }
@@ -116,6 +117,7 @@ struct App {
     voxels: Vec<PackedVoxel>,
     selected_material: u16,
     target_block_name: Option<String>,
+    jitter: HaltonJitter,
 }
 
 impl App {
@@ -134,6 +136,7 @@ impl App {
             voxels: Vec::new(),
             selected_material: 1,
             target_block_name: None,
+            jitter: HaltonJitter::new(8),
         }
     }
 
@@ -196,7 +199,7 @@ impl ApplicationHandler for App {
         self.registry = Some(registry);
 
         let size = window.inner_size();
-        let renderer = Renderer::new(
+        let mut renderer = Renderer::new(
             &gpu,
             surface,
             size.width,
@@ -207,6 +210,10 @@ impl ApplicationHandler for App {
 
         let aspect = size.width as f32 / size.height.max(1) as f32;
         self.camera.set_aspect_ratio(aspect);
+
+        // Initialize prev_view_proj with camera's starting matrix for correct TAA on first frame
+        let initial_view_proj = self.camera.view_proj().to_cols_array_2d();
+        renderer.init_prev_view_proj(initial_view_proj);
 
         self.window = Some(window);
         self.gpu = Some(gpu);
@@ -261,9 +268,19 @@ impl ApplicationHandler for App {
                         renderer.aa_mode = match renderer.aa_mode {
                             AaMode::None => AaMode::Fxaa,
                             AaMode::Fxaa => AaMode::Smaa,
-                            AaMode::Smaa => AaMode::None,
+                            AaMode::Smaa => AaMode::Taa,
+                            AaMode::Taa => AaMode::TaaThenSmaa,
+                            AaMode::TaaThenSmaa => AaMode::None,
                         };
                         println!("Anti-Aliasing Mode: {:?}", renderer.aa_mode);
+                    }
+                    return;
+                }
+
+                // F3: Cycle TAA Debug Mode
+                if key == KeyCode::F3 && state == ElementState::Pressed {
+                    if let (Some(renderer), Some(gpu)) = (&mut self.renderer, &self.gpu) {
+                        renderer.cycle_taa_debug(gpu);
                     }
                     return;
                 }
@@ -309,9 +326,7 @@ impl ApplicationHandler for App {
                                     && neighbor.z >= 0
                                     && neighbor.z < gs
                                 {
-                                    let idx = (neighbor.z * gs * gs
-                                        + neighbor.y * gs
-                                        + neighbor.x)
+                                    let idx = (neighbor.z * gs * gs + neighbor.y * gs + neighbor.x)
                                         as usize;
                                     // Prevent placing inside the camera
                                     let cam_cell = self.camera.position.floor().as_ivec3();
@@ -395,12 +410,39 @@ impl ApplicationHandler for App {
                     }
 
                     let size = window.inner_size();
-                    let uniforms = GlobalUniforms::new(
+                    let (width, height) = (size.width as f32, size.height as f32);
+
+                    // Apply TAA jitter to camera (sub-pixel offset)
+                    let jitter = if matches!(renderer.aa_mode, AaMode::Taa | AaMode::TaaThenSmaa) {
+                        self.jitter.next()
+                    } else {
+                        ara_core::glam::Vec2::ZERO
+                    };
+                    self.camera.set_jitter(jitter);
+
+                    // Get view-projection matrices for TAA
+                    // For CORRECT velocity calculation, we must use UNJITTERED matrices
+                    // The jitter is only for sampling different sub-pixel positions during rendering
+                    let prev_view_proj_unjittered = renderer.prev_view_proj();
+                    let curr_view_proj_unjittered = self.camera.view_proj().to_cols_array_2d();
+                    // Note: view_proj_jittered is applied via camera.set_jitter() and used via proj_inverse_jittered
+                    let _curr_view_proj_jittered = self
+                        .camera
+                        .view_proj_jittered(width, height)
+                        .to_cols_array_2d();
+
+                    // Use jittered inverse projection for raytracing
+                    let proj_inverse_jittered = self
+                        .camera
+                        .proj_inverse_jittered(width, height)
+                        .to_cols_array_2d();
+
+                    let uniforms = GlobalUniforms::with_view_proj(
                         self.camera.view_inverse().to_cols_array_2d(),
-                        self.camera.proj_inverse().to_cols_array_2d(),
+                        proj_inverse_jittered,
                         self.camera.position.into(),
                         time,
-                        [size.width as f32, size.height as f32],
+                        [width, height],
                         [0.4, -0.7, 0.3],
                         2.0,
                         [1.0, 0.95, 0.85],
@@ -408,23 +450,23 @@ impl ApplicationHandler for App {
                         0.15,
                         [0.15, 0.1, 0.05],
                         128.0,
-                        // Raycast logic is already run in Debug HUD section above (lines 331-341 context)
-                        // Reuse that logic or just recalculate.
-                        // Let's recalculate cleanly or store it.
                         {
                             let dir = self.camera.forward();
-                            dda_raycast(&self.voxels, self.camera.position, dir, 10.0).map(|hit| hit.grid_pos.to_array())
-                        }
+                            dda_raycast(&self.voxels, self.camera.position, dir, 10.0)
+                                .map(|hit| hit.grid_pos.to_array())
+                        },
+                        prev_view_proj_unjittered,
+                        curr_view_proj_unjittered,
                     );
 
                     // Dynamic Lights
                     let mut lights = LightBuffer::default();
-                    
+
                     // 1. Player Torch (warm light)
                     lights.lights[0] = PointLight {
                         position: (self.camera.position + self.camera.forward() * 0.5).extend(8.0), // radius = 8.0
                         color: glam::Vec4::new(1.0, 0.6, 0.3, 2.0), // intensity = 2.0
-                        flags: 1, // Shadows enabled (maybe?)
+                        flags: 1,                                   // Shadows enabled (maybe?)
                         padding: [0; 3],
                     };
                     lights.count += 1;
@@ -432,7 +474,12 @@ impl ApplicationHandler for App {
                     // 2. Lava Orb Light (red/orange)
                     if curr_x < gs && curr_z < gs {
                         lights.lights[lights.count as usize] = PointLight {
-                            position: glam::Vec4::new(curr_x as f32 + 0.5, 25.0 + 0.5, curr_z as f32 + 0.5, 12.0),
+                            position: glam::Vec4::new(
+                                curr_x as f32 + 0.5,
+                                25.0 + 0.5,
+                                curr_z as f32 + 0.5,
+                                12.0,
+                            ),
                             color: glam::Vec4::new(1.0, 0.2, 0.0, 3.0),
                             flags: 0, // No shadows for now to save perf or if inside block
                             padding: [0; 3],
@@ -440,17 +487,20 @@ impl ApplicationHandler for App {
                         lights.count += 1;
                     }
 
-                    match renderer.render(gpu, &uniforms, &lights, &crate::ui::UiContext {
-                        screen_width: size.width as f32,
-                        screen_height: size.height as f32,
-                        selected_block_name: self.target_block_name.clone().unwrap_or_default(),
-                    }) {
+                    match renderer.render(
+                        gpu,
+                        &uniforms,
+                        &lights,
+                        &crate::ui::UiContext {
+                            screen_width: size.width as f32,
+                            screen_height: size.height as f32,
+                            selected_block_name: self.target_block_name.clone().unwrap_or_default(),
+                        },
+                    ) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             let size = window.inner_size();
-                            if let Some(r) = &mut self.renderer {
-                                r.resize(gpu, size.width, size.height);
-                            }
+                            renderer.resize(gpu, size.width, size.height);
                         }
                         Err(wgpu::SurfaceError::OutOfMemory) => {
                             error!("Out of GPU memory");
@@ -460,6 +510,11 @@ impl ApplicationHandler for App {
                             error!("Surface error: {e}");
                         }
                     }
+
+                    // Update prev_view_proj AFTER rendering for NEXT frame's velocity calculation.
+                    // Store the CURRENT frame's UNJITTERED matrix so next frame can use it as "previous".
+                    // This must be done AFTER render() so the CURRENT frame uses the correct prev/current pair.
+                    renderer.update_prev_view_proj(curr_view_proj_unjittered);
                 }
 
                 // FPS counter + target block in window title
@@ -468,10 +523,7 @@ impl ApplicationHandler for App {
                 if elapsed >= 1.0 {
                     let fps = self.frame_count as f32 / elapsed;
                     let frame_ms = elapsed * 1000.0 / self.frame_count as f32;
-                    let block_label = self
-                        .target_block_name
-                        .as_deref()
-                        .unwrap_or("---");
+                    let block_label = self.target_block_name.as_deref().unwrap_or("---");
                     if let Some(window) = &self.window {
                         window.set_title(&format!(
                             "{WINDOW_TITLE} | {block_label} | {fps:.0} FPS ({frame_ms:.1} ms)"

@@ -15,7 +15,7 @@ pub use glam;
 pub use input::{Action, InputManager};
 pub use raycast::{dda_raycast, RayHit};
 pub use registry::BlockRegistry;
-pub use types::{CameraPushConstants, GlobalUniforms, InputState, LightBuffer, PointLight};
+pub use types::{CameraPushConstants, GlobalUniforms, InputState, LightBuffer, PointLight, TaaUniforms};
 pub use voxel::PackedVoxel;
 
 /// Voxel material ID.
