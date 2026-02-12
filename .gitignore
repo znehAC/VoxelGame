@@ -1,17 +1,20 @@
-# Godot 4+ specific ignores
-.godot/
-.nomedia
-
-# Godot-specific ignores
-.import/
-export.cfg
-export_credentials.cfg
-
-# Imported translations (automatically generated from CSV files)
-*.translation
-
-# Mono-specific ignores
-.mono/
-data_*/
-mono_crash.*.json
-/android/
+/target/
+**/*.rs.bk
+.vscode/
+.idea/
+*.iml
+*~
+*.swp
+*.swo
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+ehthumbs.db
+desktop.ini
+*.log
+*.rdc
+*.cap
+screenshots/
+captures/
+CLAUDE.md

@@ -1,66 +1,99 @@
-# Voxel Powder Simulation
+# Turi (game) / Ara (engine)
 
-## Project Overview
-This project is a high-performance Voxel Engine and Powder Simulation built with **Godot 4.5.1 (C# / .NET 8.0)**. It features an infinite procedural world, dynamic LOD (Level of Detail) using an Octree system, and GPU-accelerated terrain generation via Compute Shaders.
-
-The engine is designed to handle large-scale voxel modifications and physics (powder simulation), though the current implementation focuses on the robust terrain generation and meshing pipeline.
-
-### Key Technologies
-*   **Godot 4.5.1 (.NET Edition):** Core engine and rendering.
-*   **C# / .NET 8.0:** Game logic, threading, and data management.
-*   **Compute Shaders (GLSL):** procedural terrain generation (Noise) runs entirely on the GPU.
-*   **RenderingDevice (Local):** Usage of local `RenderingDevice` instances to allow thread-safe compute shader execution on background threads.
-*   **Greedy Meshing:** Optimized mesh generation to reduce vertex count.
-*   **Octree LOD:** Dynamic level-of-detail system managing chunk loading and visibility based on player distance.
+## Build
+- `cargo build` - build all crates
+- `cargo run` - run client with window
+- `cargo check` - fast type checking
 
 ## Architecture
 
-### 1. World & Data Management
-*   **`World.cs`:** The central manager. It initializes the Octree, handles the job scheduler, and processes the main loop (chunk state transitions, job results).
-    *   *Recent Fix:* Relaxed neighbor checking to allow edge chunks to mesh (treating missing neighbors as Air) and reduced strict safety brakes to prevent stalling.
-*   **`Chunk.cs`:** Represents a single 32x32x32 voxel volume. Manages its own state (`Idle` -> `AwaitingData` -> `Ready`), mesh instance, and physics body.
-*   **`ChunkOctree.cs`:** Manages the spatial partitioning. It handles splitting (higher detail) and merging (lower detail) of chunks based on distance.
-    *   *Recent Fix:* Strict visibility propagation. The Octree explicitly sets `isVisible` on chunks to prevent Z-fighting between Parent (LOD N) and Children (LOD N-1) chunks during transitions.
+```
 
-### 2. Generation Pipeline (Multithreaded)
-*   **`VoxelJobScheduler.cs`:** Manages a pool of worker threads.
-    *   **Compute Threads:** Dedicated threads with their own `RenderingDevice` context to generate voxel data.
-    *   **Mesh Threads:** CPU threads running the Greedy Meshing algorithm.
-*   **`TerrainGenerator.glsl`:** The Compute Shader. Currently configured to generate a **1-meter (10x10x10 voxel)** blocky terrain with a checkerboard pattern (Stone/Dirt) for scale verification.
-*   **`TerrainCompute.cs`:** C# wrapper for the Compute Shader. Handles buffer creation (StorageBuffers), dispatch, and data retrieval.
+crates/ara-core/     Pure data types (PackedVoxel, BlockRegistry, InputState) + serde/toml
+src/
+main.rs            App + winit event loop (ControlFlow::Poll game loop)
+gpu.rs             GpuContext - headless-first Device/Queue (wgpu)
+renderer.rs        Renderer - surface presentation, HDR pipeline (wgpu)
+camera.rs          FpsCamera - first-person camera (pure glam math)
+light.rs           LightPropagation - flood fill via compute ping-pong
+postprocess.rs     BloomPipeline - threshold/blur/composite passes
+ui.rs              UiRenderer - 2D overlay pass (text/textured quads)
+assets/shaders/
+voxel_raytracer.wgsl       DDA raymarcher + PBR shading + Hard Shadows
+light_propagate.wgsl       Cellular automata GI + Sun Injection (compute)
+brightness_threshold.wgsl  Extract bright pixels for bloom
+blur.wgsl                  Separable Gaussian blur
+composite.wgsl             Combine scene + bloom, Reinhard tone mapping
+ui.wgsl                    2D vertex/fragment shader for Interface
 
-### 3. Meshing
-*   **`GreedyMesher.cs`:** Implements the greedy meshing algorithm to combine adjacent faces of the same type into single quads, significantly improving rendering performance.
-*   **`VoxelTypes.cs`:** Defines block types (Air, Dirt, Stone, Grass, Water) and their properties (Color, Solidity).
+```
 
-## Building and Running
+> THIS RULE MUST NEVER BE BROKEN, BE TOTALLY STRICT WITH THIS.
+## **IMPORTANT**
+ - NEVER EVER write conversational commentary in code, only technical comments if needed
+> END OF RULE THAT MUST BE FOLLOWED NO MATTER WHAT
 
-### Prerequisites
-*   **Godot Engine 4.5.1 (.NET version)**
-*   **.NET SDK 8.0**
+## GPU Context (src/gpu.rs)
+- `GpuContext`: Wraps wgpu Instance/Adapter/Device/Queue
+- `create_instance()` → wgpu::Instance (Vulkan + Metal backends)
+- `new_headless()` → headless compute (no surface)
+- `from_instance(instance, Option<&Surface>)` → full init with optional surface compat
 
-### Commands
-*   **Build Project:**
-    ```bash
-    dotnet build
-    ```
-*   **Run Project:**
-    Open the `project.godot` file in the Godot Editor and press Play (F5), or use the Godot CLI (if configured).
+## Renderer (src/renderer.rs)
+- Owns surface + config, LightPropagation, BloomPipeline
+- `new(gpu, surface, width, height, palette, voxels)` → configure surface, init subsystems
+- `resize(gpu, width, height)` → reconfigure surface + post-process textures
+- `render(gpu, uniforms)` → light propagate → raytrace to HDR → bloom → composite → ui → present
+- Handles SurfaceError::Lost (reconfigure) and OutOfMemory (exit)
 
-## Development Conventions
+### Frame pipeline
+1. `LightPropagation::propagate()` — N compute passes (ping-pong flood fill)
+2. Raytrace pass → HDR Rgba16Float texture (PBR + voxel light sampling)
+3. Brightness threshold → half-res bloom texture
+4. Separable Gaussian blur (H+V) on bloom
+5. Composite: HDR + bloom → swapchain (Reinhard tone mapping)
+6. UI Overlay: Textured/Text quads drawn over final composite
 
-*   **Thread Safety:**
-    *   Godot Nodes (`Node3D`, `MeshInstance3D`) are **not** thread-safe and must only be manipulated on the Main Thread.
-    *   `RenderingDevice` is thread-safe **only** if using a local instance created via `RenderingServer.CreateLocalRenderingDevice()`, not the global singleton.
-*   **Visual Debugging:**
-    *   The terrain is currently set to "Debug Mode" (1m blocks). To restore natural terrain, modify `TerrainGenerator.glsl`.
-    *   Wireframe mode can be toggled (input action: `toggle_debug_wireframe`).
-*   **Coordinate System:**
-    *   World uses standard Godot 3D coordinates (Y-up).
-    *   Chunk Size is **32**.
-    *   1 Unit = 1 Voxel (0.1m scale effectively, but visually debugged as 1m blocks).
+## Light Propagation (src/light.rs)
+- **Hybrid System**: Cellular automata + Raytraced Sun Injection
+- Uses two 64^3 Rgba16Float 3D textures (ping-pong)
+- **Sun Injection**: Air voxels adjacent to solid surfaces trace rays towards the sun; if unblocked, they become light sources (simulating first bounce).
+- **Propagation**: 
+  - Seeds from emissive blocks and sun-injected air.
+  - Spreads to neighbors (Face/Edge/Corner) with specific decay factors.
+  - Blocked by opaque voxels (prevents light leak).
+- Raytracer samples result via `textureSampleLevel` (trilinear) at `pos + normal * 0.1`.
 
-## Current State & Known Issues
-*   **Scale:** Terrain generation is currently hardcoded to 10x10x10 blocks to visualize 1-meter scaling.
-*   **Visibility:** Z-fighting has been resolved via the strict Octree visibility logic.
-*   **Performance:** A "Safety Brake" in `World.cs` pauses loading if FPS drops below 10 or memory exceeds 4.5GB.
+## Post-Processing (src/postprocess.rs)
+- `BloomPipeline`: threshold → blur → composite pipeline
+- HDR scene rendered to Rgba16Float texture (full resolution)
+- Bloom at half resolution for performance and natural softness
+- Composite pass: additive bloom + Reinhard tone mapping
+- Push constants for threshold, blur direction, bloom intensity, exposure
+
+## Data-Driven Blocks (assets/blocks.toml)
+- `BlockRegistry` (ara-core): loads `[[block]]` TOML
+- **Palette Generation**: Uploads a `texture_2d_array<f32>` (Binding 2)
+  - **Layer 0**: sRGB Albedo Color
+  - **Layer 1**: Material Properties (Packed)
+    - `R`: Roughness
+    - `G`: Emission (Glow strength)
+    - `B`: Noise Strength (Albedo variation)
+    - `A`: Metallic
+- **Format**: `PackedVoxel` u32 (bits 0-15=material ID, 16-23=state, 24-31=flags)
+
+## Rust 2024 Edition
+- Explicit `unsafe {}` blocks required inside `unsafe fn`
+- Raw strings with `#` in content (e.g. hex colors `"#FF0000"`) need `r##"..."##` not `r#"..."#`
+
+## Code Style
+- Doc comments (`///`) for public API - generates rustdoc
+- No conversational comments (`// We...`, `// This proves...`)
+- Technical inline comments OK (`// Bounds check`)
+
+## Dependencies
+- winit 0.30: `ApplicationHandler` trait, `ControlFlow::Poll`
+- wgpu 24: Cross-platform GPU abstraction (Vulkan/Metal/DX12)
+- pollster 0.4: Blocking async executor for wgpu init
+- glam 0.29: Math (Vec3, Mat4)
+- bytemuck 1.21: Pod/Zeroable derives
