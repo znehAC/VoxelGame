@@ -1,7 +1,7 @@
 //! GPU-based RGB light propagation via cellular automata on 3D textures.
 
 use crate::gpu::GpuContext;
-use ara_core::GRID_SIZE;
+use ara_core::LIGHT_GRID_SIZE;
 
 /// Ping-pong light propagation system using two 64^3 RGBA8 volumes.
 pub struct LightPropagation {
@@ -272,7 +272,7 @@ impl LightPropagation {
 
     /// Run N iterations of light propagation with ping-pong swapping.
     pub fn propagate(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        let workgroups = GRID_SIZE / 4;
+        let workgroups = LIGHT_GRID_SIZE / 4;
 
         for _ in 0..self.iterations {
             let bind_group = if self.current_is_a {
@@ -314,9 +314,9 @@ fn create_light_volume(device: &wgpu::Device, label: &str) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
-            width: GRID_SIZE,
-            height: GRID_SIZE,
-            depth_or_array_layers: GRID_SIZE,
+            width: LIGHT_GRID_SIZE,
+            height: LIGHT_GRID_SIZE,
+            depth_or_array_layers: LIGHT_GRID_SIZE,
         },
         mip_level_count: 1,
         sample_count: 1,

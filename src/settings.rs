@@ -30,13 +30,13 @@ impl Default for RenderSettings {
             sky_color: [0.4, 0.6, 0.9],
             sky_intensity: 0.15,
             ground_color: [0.15, 0.1, 0.05],
-            light_max_distance: 128.0,
-            camera_move_speed: 10.0,
+            light_max_distance: 512.0,
+            camera_move_speed: 30.0,
             camera_sprint_multiplier: 3.0,
             camera_mouse_sensitivity: 0.002,
             camera_fov: std::f32::consts::FRAC_PI_4,
-            camera_start_position: [32.0, 62.0, 10.0],
-            camera_start_pitch: -0.3,
+            camera_start_position: [256.0, 250.0, 85.0],
+            camera_start_pitch: -0.1,
         }
     }
 }

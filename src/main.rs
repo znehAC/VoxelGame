@@ -22,8 +22,8 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use ara_core::glam;
 use ara_core::{
-    Action, BlockRegistry, GRID_SIZE, GlobalUniforms, InputManager, LightBuffer, PackedVoxel,
-    PointLight, dda_raycast,
+    Action, BlockRegistry, CHUNKS_PER_AXIS, CHUNK_SIZE, GRID_SIZE, GlobalUniforms, InputManager,
+    LightBuffer, PackedVoxel, PointLight, dda_raycast,
 };
 use camera::{FpsCamera, HaltonJitter};
 use gpu::GpuContext;
@@ -46,72 +46,109 @@ fn default_input_bindings() -> InputManager {
     input
 }
 
-/// Generate a 64x64x64 test voxel volume: checkerboard ground + lava pool.
-/// Generate a 64x64x64 room scene with walls and a moving lava block.
+/// Generate a 512³ room scene with walls, checkerboard floor, and pillars.
 fn generate_room_scene() -> Vec<PackedVoxel> {
     let size = GRID_SIZE as usize;
     let mut voxels = vec![PackedVoxel::AIR; size * size * size];
 
-    let ground_y = 10;
-    let ceiling_y = 50;
-    let min_xz = 10;
-    let max_xz = 53;
+    let ground_y = 80;
+    let ceiling_y = 400;
+    let min_xz = 80;
+    let max_xz = 430;
 
-    // Simple pseudo-random number generator for visual variants
     let mut rng_seed = 12345u32;
     let mut next_variant = || -> u8 {
         rng_seed = rng_seed.wrapping_mul(1664525).wrapping_add(1013904223);
         ((rng_seed >> 16) & 0xF) as u8
     };
 
+    for z in min_xz..=max_xz {
+        for x in min_xz..=max_xz {
+            // Floor
+            let idx = z * size * size + ground_y * size + x;
+            let mat = if (x + z) % 2 == 0 { 1u16 } else { 3u16 };
+            let variant = if mat == 1 { next_variant() } else { 0 };
+            voxels[idx] = PackedVoxel::with_all(mat, 0, 0, variant, 0);
+
+            // Ceiling
+            let idx = z * size * size + ceiling_y * size + x;
+            voxels[idx] = PackedVoxel::new(6);
+        }
+    }
+
+    // Walls
+    for y in (ground_y + 1)..ceiling_y {
+        for xz in min_xz..=max_xz {
+            // X walls
+            let idx_min_x = xz * size * size + y * size + min_xz;
+            voxels[idx_min_x] = PackedVoxel::with_all(1, 0, 0, next_variant(), 0);
+            let idx_max_x = xz * size * size + y * size + max_xz;
+            voxels[idx_max_x] = PackedVoxel::with_all(1, 0, 0, next_variant(), 0);
+
+            // Z walls
+            let idx_min_z = min_xz * size * size + y * size + xz;
+            voxels[idx_min_z] = PackedVoxel::with_all(1, 0, 0, next_variant(), 0);
+            let idx_max_z = max_xz * size * size + y * size + xz;
+            voxels[idx_max_z] = PackedVoxel::with_all(1, 0, 0, next_variant(), 0);
+        }
+    }
+
+    // Pillars
+    for y in (ground_y + 1)..(ground_y + 40) {
+        let idx1 = 160 * size * size + y * size + 160;
+        voxels[idx1] = PackedVoxel::new(2);
+
+        let idx2 = 320 * size * size + y * size + 320;
+        voxels[idx2] = PackedVoxel::new(2);
+    }
+
+    voxels
+}
+
+/// Build occupancy buffer from voxel data (1 = chunk contains geometry).
+fn compute_occupancy(voxels: &[PackedVoxel]) -> Vec<u32> {
+    let chunks = CHUNKS_PER_AXIS as usize;
+    let mut occupancy = vec![0u32; chunks * chunks * chunks];
+
+    let size = GRID_SIZE as usize;
+    let cs = CHUNK_SIZE as usize;
+
     for z in 0..size {
-        for x in 0..size {
-            for y in 0..size {
+        let cz = z / cs;
+        for y in 0..size {
+            let cy = y / cs;
+            for x in 0..size {
                 let idx = z * size * size + y * size + x;
-
-                // Floor (Checkerboard)
-                if y == ground_y && x >= min_xz && x <= max_xz && z >= min_xz && z <= max_xz {
-                    // Stone (1) / Grass (3) checkerboard
-                    let mat = if (x + z) % 2 == 0 { 1u16 } else { 3u16 };
-                    // Use random variant for stone to test noise
-                    let variant = if mat == 1 { next_variant() } else { 0 };
-                    voxels[idx] = PackedVoxel::with_all(mat, 0, 0, variant, 0);
-                    continue;
-                }
-
-                // Ceiling (Wood)
-                if y == ceiling_y && x >= min_xz && x <= max_xz && z >= min_xz && z <= max_xz {
-                    voxels[idx] = PackedVoxel::new(6); // Wood
-                    continue;
-                }
-
-                // Walls (Stone)
-                if y > ground_y && y < ceiling_y {
-                    let is_wall_x = x == min_xz || x == max_xz;
-                    let is_wall_z = z == min_xz || z == max_xz;
-
-                    if (is_wall_x && z >= min_xz && z <= max_xz)
-                        || (is_wall_z && x >= min_xz && x <= max_xz)
-                    {
-                        // Assign random variant to wall stones too
-                        voxels[idx] = PackedVoxel::with_all(1, 0, 0, next_variant(), 0);
-                        continue;
-                    }
+                if !voxels[idx].is_air() {
+                    let cx = x / cs;
+                    occupancy[cz * chunks * chunks + cy * chunks + cx] = 1;
                 }
             }
         }
     }
 
-    // Add some random pillars inside
-    for y in ground_y + 1..ground_y + 5 {
-        let idx1 = 20 * size * size + y * size + 20;
-        voxels[idx1] = PackedVoxel::new(2); // Dirt
+    occupancy
+}
 
-        let idx2 = 40 * size * size + y * size + 40;
-        voxels[idx2] = PackedVoxel::new(2); // Dirt
+/// Re-scan a single chunk to determine if it still has any non-air voxels.
+fn rescan_chunk(voxels: &[PackedVoxel], cx: usize, cy: usize, cz: usize) -> u32 {
+    let size = GRID_SIZE as usize;
+    let cs = CHUNK_SIZE as usize;
+    let base_x = cx * cs;
+    let base_y = cy * cs;
+    let base_z = cz * cs;
+
+    for z in base_z..(base_z + cs) {
+        for y in base_y..(base_y + cs) {
+            for x in base_x..(base_x + cs) {
+                let idx = z * size * size + y * size + x;
+                if !voxels[idx].is_air() {
+                    return 1;
+                }
+            }
+        }
     }
-
-    voxels
+    0
 }
 
 struct App {
@@ -127,6 +164,7 @@ struct App {
     frame_count: u32,
     fps_update_time: Instant,
     voxels: Vec<PackedVoxel>,
+    occupancy: Vec<u32>,
     selected_material: u16,
     target_block_name: Option<String>,
     jitter: HaltonJitter,
@@ -156,6 +194,7 @@ impl App {
             frame_count: 0,
             fps_update_time: Instant::now(),
             voxels: Vec::new(),
+            occupancy: Vec::new(),
             selected_material: 1,
             target_block_name: None,
             jitter: HaltonJitter::new(8),
@@ -217,7 +256,9 @@ impl ApplicationHandler for App {
         info!("Loaded {} block types", registry.block_count());
 
         let test_voxels = generate_room_scene();
+        let occupancy = compute_occupancy(&test_voxels);
         self.voxels = test_voxels.clone();
+        self.occupancy = occupancy.clone();
         self.registry = Some(registry);
 
         let size = window.inner_size();
@@ -228,6 +269,7 @@ impl ApplicationHandler for App {
             size.height,
             &palette_data,
             &test_voxels,
+            &occupancy,
             self.settings.bloom_threshold,
             self.settings.bloom_intensity,
             self.settings.bloom_exposure,
@@ -321,10 +363,21 @@ impl ApplicationHandler for App {
                 let dir = self.camera.forward();
                 if let Some(hit) = dda_raycast(&self.voxels, self.camera.position, dir, 64.0) {
                     if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
+                        let cs = CHUNK_SIZE as usize;
+                        let chunks = CHUNKS_PER_AXIS as usize;
                         match button {
                             MouseButton::Left => {
                                 self.voxels[hit.index] = PackedVoxel::AIR;
                                 renderer.update_voxel_at(gpu, hit.index, PackedVoxel::AIR);
+
+                                let p = hit.grid_pos;
+                                let cx = p.x as usize / cs;
+                                let cy = p.y as usize / cs;
+                                let cz = p.z as usize / cs;
+                                let chunk_idx = cz * chunks * chunks + cy * chunks + cx;
+                                self.occupancy[chunk_idx] =
+                                    rescan_chunk(&self.voxels, cx, cy, cz);
+                                renderer.update_occupancy(gpu, &self.occupancy);
                             }
                             MouseButton::Right => {
                                 let gs = GRID_SIZE as i32;
@@ -338,12 +391,19 @@ impl ApplicationHandler for App {
                                 {
                                     let idx = (neighbor.z * gs * gs + neighbor.y * gs + neighbor.x)
                                         as usize;
-                                    // Prevent placing inside the camera
                                     let cam_cell = self.camera.position.floor().as_ivec3();
                                     if neighbor != cam_cell {
                                         let voxel = PackedVoxel::new(self.selected_material);
                                         self.voxels[idx] = voxel;
                                         renderer.update_voxel_at(gpu, idx, voxel);
+
+                                        let cx = neighbor.x as usize / cs;
+                                        let cy = neighbor.y as usize / cs;
+                                        let cz = neighbor.z as usize / cs;
+                                        let chunk_idx =
+                                            cz * chunks * chunks + cy * chunks + cx;
+                                        self.occupancy[chunk_idx] = 1;
+                                        renderer.update_occupancy(gpu, &self.occupancy);
                                     }
                                 }
                             }
@@ -394,19 +454,28 @@ impl ApplicationHandler for App {
                     let gs = GRID_SIZE as usize;
 
                     // Animated lava orb — partial writes only
-                    let radius = 15.0;
-                    let center_x = 32.0;
-                    let center_z = 32.0;
-                    let y = 25usize;
+                    let radius = 120.0;
+                    let center_x = 256.0;
+                    let center_z = 256.0;
+                    let y = 200usize;
 
                     let prev_angle = (time - dt) * 1.0;
                     let prev_x = (center_x + radius * prev_angle.cos()) as usize;
                     let prev_z = (center_z + radius * prev_angle.sin()) as usize;
 
+                    let cs = CHUNK_SIZE as usize;
+                    let chunks = CHUNKS_PER_AXIS as usize;
+
                     if prev_x < gs && prev_z < gs {
                         let idx = prev_z * gs * gs + y * gs + prev_x;
                         self.voxels[idx] = PackedVoxel::AIR;
                         renderer.update_voxel_at(gpu, idx, PackedVoxel::AIR);
+
+                        let cx = prev_x / cs;
+                        let cy = y / cs;
+                        let cz = prev_z / cs;
+                        let ci = cz * chunks * chunks + cy * chunks + cx;
+                        self.occupancy[ci] = rescan_chunk(&self.voxels, cx, cy, cz);
                     }
 
                     let angle = time * 1.0;
@@ -417,7 +486,14 @@ impl ApplicationHandler for App {
                         let idx = curr_z * gs * gs + y * gs + curr_x;
                         self.voxels[idx] = PackedVoxel::new(8);
                         renderer.update_voxel_at(gpu, idx, PackedVoxel::new(8));
+
+                        let cx = curr_x / cs;
+                        let cy = y / cs;
+                        let cz = curr_z / cs;
+                        self.occupancy[cz * chunks * chunks + cy * chunks + cx] = 1;
                     }
+
+                    renderer.update_occupancy(gpu, &self.occupancy);
 
                     let size = window.inner_size();
                     let (width, height) = (size.width as f32, size.height as f32);
@@ -488,7 +564,7 @@ impl ApplicationHandler for App {
                         lights.lights[lights.count as usize] = PointLight {
                             position: glam::Vec4::new(
                                 curr_x as f32 + 0.5,
-                                25.0 + 0.5,
+                                y as f32 + 0.5,
                                 curr_z as f32 + 0.5,
                                 12.0,
                             ),

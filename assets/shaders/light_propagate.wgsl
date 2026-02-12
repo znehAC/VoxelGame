@@ -1,5 +1,7 @@
-const GRID_SIZE: u32 = 64u;
-const GS: i32 = 64;
+const LIGHT_GRID: u32 = 64u;
+const LG: i32 = 64;
+const VOXEL_GRID: u32 = 512u;
+const VSCALE: u32 = 8u; // VOXEL_GRID / LIGHT_GRID
 
 // Multiplicative attenuation factors
 // Use float math directly. no more integer approximations.
@@ -32,20 +34,25 @@ const BOUNCE_INTENSITY: f32 = 0.2; // How much sun light bounces off walls
 @group(0) @binding(4) var<uniform> globals: GlobalUniforms;
 
 fn voxel_index(pos: vec3<u32>) -> u32 {
-    return pos.z * GRID_SIZE * GRID_SIZE + pos.y * GRID_SIZE + pos.x;
+    return pos.z * VOXEL_GRID * VOXEL_GRID + pos.y * VOXEL_GRID + pos.x;
 }
 
 fn voxel_idx_i(pos: vec3i) -> u32 {
-    return u32(pos.z) * GRID_SIZE * GRID_SIZE + u32(pos.y) * GRID_SIZE + u32(pos.x);
+    return u32(pos.z) * VOXEL_GRID * VOXEL_GRID + u32(pos.y) * VOXEL_GRID + u32(pos.x);
 }
 
 fn in_bounds(p: vec3i) -> bool {
-    return p.x >= 0 && p.x < GS && p.y >= 0 && p.y < GS && p.z >= 0 && p.z < GS;
+    return p.x >= 0 && p.x < LG && p.y >= 0 && p.y < LG && p.z >= 0 && p.z < LG;
+}
+
+fn light_to_voxel(p: vec3i) -> vec3i {
+    return p * i32(VSCALE) + i32(VSCALE / 2u);
 }
 
 fn is_opaque_at(p: vec3i) -> bool {
     if !in_bounds(p) { return true; }
-    return (voxels[voxel_idx_i(p)] & 0x3FFFu) != 0u;
+    let vp = light_to_voxel(p);
+    return (voxels[voxel_idx_i(vp)] & 0x3FFFu) != 0u;
 }
 
 fn read_light(p: vec3i) -> vec3f {
@@ -85,45 +92,34 @@ fn check_sun_path(start_pos: vec3i, sun_dir: vec3f) -> bool {
 
 @compute @workgroup_size(4, 4, 4)
 fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if gid.x >= GRID_SIZE || gid.y >= GRID_SIZE || gid.z >= GRID_SIZE {
+    if gid.x >= LIGHT_GRID || gid.y >= LIGHT_GRID || gid.z >= LIGHT_GRID {
         return;
     }
 
-    let packed = voxels[voxel_index(gid)];
+    // Map light-grid cell to voxel-grid center sample
+    let voxel_pos = vec3<u32>(light_to_voxel(vec3i(gid)));
+    let packed = voxels[voxel_index(voxel_pos)];
     let material_id = packed & 0x3FFFu;
 
-    // Palette lookup for emission check
     let pu = material_id % 256u;
     let pv = material_id / 256u;
     let coords = vec2i(i32(pu), i32(pv));
-    
-    // Use Level 0 for palette lookups
-    // Use Level 0 for palette lookups
+
     let albedo = textureLoad(t_palette, coords, 0, 0).rgb;
     let props = textureLoad(t_palette, coords, 1, 0);
-    // Unpack props: R=Roughness, G=Emission, B=Noise, A=Metallic
     let emission = props.g;
 
-    // Emission injection
     var emit = vec3f(0.0);
     if emission > 0.01 {
-        // Boost emission for visual punch
-        emit = albedo * emission * 5.0; 
+        emit = albedo * emission * 5.0;
     }
 
-    // Sky light injected at top boundary
-    // Sky light injected at top boundary
-    // Dynamic Sky Color based on Sun
     var sky = vec3f(0.0);
-    if gid.y == GRID_SIZE - 1u {
-        // Night base (deep blue) + Sun influence (orange/white)
+    if gid.y == LIGHT_GRID - 1u {
         let night_base = vec3f(0.02, 0.02, 0.05);
         sky = globals.sun_color.rgb * 0.5 + night_base;
     }
 
-    // Solid Block Logic:
-    // If I am solid, I just emit my own light. I do NOT receive light from neighbors.
-    // This ensures walls stop light.
     if material_id != 0u {
         textureStore(light_dst, gid, vec4f(emit, 1.0));
         return;

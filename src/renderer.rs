@@ -1,7 +1,7 @@
 //! Presentation layer: fullscreen-quad pipeline with palette texture, voxel SSBO, and uniforms.
 
 use ara_core::glam::Mat4;
-use ara_core::{GlobalUniforms, LightBuffer, PackedVoxel, bytemuck};
+use ara_core::{CHUNKS_PER_AXIS, GlobalUniforms, LightBuffer, PackedVoxel, bytemuck};
 
 use crate::assets;
 use crate::gpu::GpuContext;
@@ -52,6 +52,7 @@ pub struct Renderer {
     uniform_buf: wgpu::Buffer,
     light_buf: wgpu::Buffer,
     voxel_buf: wgpu::Buffer,
+    occupancy_buf: wgpu::Buffer,
     palette_tex: wgpu::Texture,
     light: LightPropagation,
     post_process: BloomPipeline,
@@ -92,6 +93,7 @@ impl Renderer {
         height: u32,
         palette_data: &[u8],
         voxel_data: &[PackedVoxel],
+        occupancy_data: &[u32],
         bloom_threshold: f32,
         bloom_intensity: f32,
         bloom_exposure: f32,
@@ -320,6 +322,17 @@ impl Renderer {
         });
         gpu.queue().write_buffer(&voxel_buf, 0, voxel_bytes);
 
+        // Occupancy buffer (CHUNKS_PER_AXIS^3 u32s)
+        let occupancy_size = (CHUNKS_PER_AXIS * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS) as usize;
+        let occupancy_buf = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ara Occupancy SSBO"),
+            size: (occupancy_size * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        gpu.queue()
+            .write_buffer(&occupancy_buf, 0, bytemuck::cast_slice(occupancy_data));
+
         // Uniform buffer
         let uniform_buf = gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ara Global Uniforms"),
@@ -393,6 +406,17 @@ impl Renderer {
                             },
                             count: None,
                         },
+                        // binding 6: occupancy buffer
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 6,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                 });
 
@@ -419,6 +443,10 @@ impl Renderer {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: light_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: occupancy_buf.as_entire_binding(),
                 },
             ],
         });
@@ -518,6 +546,7 @@ impl Renderer {
             uniform_buf,
             light_buf,
             voxel_buf,
+            occupancy_buf,
             palette_tex,
             light,
             post_process,
@@ -858,5 +887,11 @@ impl Renderer {
         let offset = (index * std::mem::size_of::<PackedVoxel>()) as u64;
         gpu.queue()
             .write_buffer(&self.voxel_buf, offset, bytemuck::bytes_of(&voxel));
+    }
+
+    /// Upload updated occupancy data to the GPU.
+    pub fn update_occupancy(&self, gpu: &GpuContext, data: &[u32]) {
+        gpu.queue()
+            .write_buffer(&self.occupancy_buf, 0, bytemuck::cast_slice(data));
     }
 }

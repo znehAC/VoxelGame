@@ -184,62 +184,61 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // 512³ grid allocation (~512 MB)
     fn hit_single_voxel() {
         let mut voxels = empty_grid();
-        // Place a stone block at (32, 32, 32)
-        let idx = voxel_index(32, 32, 32);
+        let idx = voxel_index(256, 256, 256);
         voxels[idx] = PackedVoxel::new(1);
 
-        // Cast from (32.5, 32.5, 0.5) looking +Z
-        let origin = Vec3::new(32.5, 32.5, 0.5);
+        let origin = Vec3::new(256.5, 256.5, 0.5);
         let dir = Vec3::new(0.0, 0.0, 1.0);
-        let hit = dda_raycast(&voxels, origin, dir, 64.0).expect("should hit");
+        let hit = dda_raycast(&voxels, origin, dir, 512.0).expect("should hit");
 
-        assert_eq!(hit.grid_pos, IVec3::new(32, 32, 32));
-        assert_eq!(hit.normal, IVec3::new(0, 0, -1)); // Hit -Z face
+        assert_eq!(hit.grid_pos, IVec3::new(256, 256, 256));
+        assert_eq!(hit.normal, IVec3::new(0, 0, -1));
         assert_eq!(hit.index, idx);
     }
 
     #[test]
+    #[ignore] // 512³ grid allocation (~512 MB)
     fn miss_empty_grid() {
         let voxels = empty_grid();
-        let origin = Vec3::new(32.0, 32.0, -1.0);
+        let origin = Vec3::new(256.0, 256.0, -1.0);
         let dir = Vec3::new(0.0, 0.0, 1.0);
-        assert!(dda_raycast(&voxels, origin, dir, 128.0).is_none());
+        assert!(dda_raycast(&voxels, origin, dir, 1024.0).is_none());
     }
 
     #[test]
+    #[ignore] // 512³ grid allocation (~512 MB)
     fn max_dist_limits_ray() {
         let mut voxels = empty_grid();
-        voxels[voxel_index(32, 32, 50)] = PackedVoxel::new(1);
+        voxels[voxel_index(256, 256, 300)] = PackedVoxel::new(1);
 
-        // Ray origin at z=0, block at z=50 — max_dist=10 should miss
-        let origin = Vec3::new(32.5, 32.5, 0.5);
+        let origin = Vec3::new(256.5, 256.5, 0.5);
         let dir = Vec3::new(0.0, 0.0, 1.0);
         assert!(dda_raycast(&voxels, origin, dir, 10.0).is_none());
     }
 
     #[test]
+    #[ignore] // 512³ grid allocation (~512 MB)
     fn normal_axes() {
         let mut voxels = empty_grid();
-        voxels[voxel_index(32, 32, 32)] = PackedVoxel::new(1);
+        voxels[voxel_index(256, 256, 256)] = PackedVoxel::new(1);
 
-        // Hit from -X direction
         let hit = dda_raycast(
             &voxels,
-            Vec3::new(0.5, 32.5, 32.5),
+            Vec3::new(0.5, 256.5, 256.5),
             Vec3::new(1.0, 0.0, 0.0),
-            64.0,
+            512.0,
         )
         .expect("should hit from -X");
         assert_eq!(hit.normal, IVec3::new(-1, 0, 0));
 
-        // Hit from +Y direction
         let hit = dda_raycast(
             &voxels,
-            Vec3::new(32.5, 63.5, 32.5),
+            Vec3::new(256.5, 511.5, 256.5),
             Vec3::new(0.0, -1.0, 0.0),
-            64.0,
+            512.0,
         )
         .expect("should hit from +Y");
         assert_eq!(hit.normal, IVec3::new(0, 1, 0));

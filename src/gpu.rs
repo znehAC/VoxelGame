@@ -42,6 +42,8 @@ impl GpuContext {
 
         let mut limits = wgpu::Limits::default();
         limits.max_push_constant_size = 128;
+        limits.max_buffer_size = 1 << 30; // 1 GiB (512³ × 4 = 512 MB)
+        limits.max_storage_buffer_binding_size = 1 << 30;
 
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
