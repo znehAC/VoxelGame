@@ -1,7 +1,7 @@
 //! Presentation layer: fullscreen-quad pipeline with palette texture, voxel SSBO, and uniforms.
 
 use ara_core::glam::Mat4;
-use ara_core::{CHUNKS_PER_AXIS, GlobalUniforms, LightBuffer, PackedVoxel, bytemuck};
+use ara_core::{GlobalUniforms, LightBuffer, bytemuck};
 
 use crate::assets;
 use crate::gpu::GpuContext;
@@ -49,11 +49,11 @@ pub struct Renderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
+    bind_group_layout: wgpu::BindGroupLayout,
     uniform_buf: wgpu::Buffer,
     light_buf: wgpu::Buffer,
-    voxel_buf: wgpu::Buffer,
-    occupancy_buf: wgpu::Buffer,
     palette_tex: wgpu::Texture,
+    palette_sampler: wgpu::Sampler,
     light: LightPropagation,
     post_process: BloomPipeline,
     fxaa: FxaaPipeline,
@@ -92,8 +92,8 @@ impl Renderer {
         width: u32,
         height: u32,
         palette_data: &[u8],
-        voxel_data: &[PackedVoxel],
-        occupancy_data: &[u32],
+        voxel_buf: &wgpu::Buffer,
+        occupancy_buf: &wgpu::Buffer,
         bloom_threshold: f32,
         bloom_intensity: f32,
         bloom_exposure: f32,
@@ -312,27 +312,6 @@ impl Renderer {
             ..Default::default()
         });
 
-        // Voxel SSBO
-        let voxel_bytes = bytemuck::cast_slice::<PackedVoxel, u8>(voxel_data);
-        let voxel_buf = gpu.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Ara Voxel SSBO"),
-            size: voxel_bytes.len() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        gpu.queue().write_buffer(&voxel_buf, 0, voxel_bytes);
-
-        // Occupancy buffer (CHUNKS_PER_AXIS^3 u32s)
-        let occupancy_size = (CHUNKS_PER_AXIS * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS) as usize;
-        let occupancy_buf = gpu.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Ara Occupancy SSBO"),
-            size: (occupancy_size * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        gpu.queue()
-            .write_buffer(&occupancy_buf, 0, bytemuck::cast_slice(occupancy_data));
-
         // Uniform buffer
         let uniform_buf = gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ara Global Uniforms"),
@@ -452,7 +431,7 @@ impl Renderer {
         });
 
         // Light propagation system
-        let light = LightPropagation::new(gpu, &voxel_buf, &uniform_buf, &palette_tex, 25);
+        let light = LightPropagation::new(gpu, &voxel_buf, &occupancy_buf, &uniform_buf, &palette_tex, 10);
 
         // Load shader from assets, panic if file not found (no fallback)
         let shader_src = assets::load_shader().expect("Failed to load voxel_raytracer.wgsl");
@@ -543,11 +522,11 @@ impl Renderer {
             config,
             pipeline,
             bind_group,
+            bind_group_layout,
             uniform_buf,
             light_buf,
-            voxel_buf,
-            occupancy_buf,
             palette_tex,
+            palette_sampler,
             light,
             post_process,
             fxaa,
@@ -571,6 +550,57 @@ impl Renderer {
             width: width.max(1),
             height: height.max(1),
         }
+    }
+
+    /// Update the voxel buffer bind group.
+    pub fn update_voxel_bind_group(
+        &mut self,
+        device: &wgpu::Device,
+        voxel_buf: &wgpu::Buffer,
+        occupancy_buf: &wgpu::Buffer,
+    ) {
+        let palette_view = self.palette_tex.create_view(&wgpu::TextureViewDescriptor {
+            label: Some("Ara Palette View"),
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+
+        self.bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Ara Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&palette_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::Sampler(&self.palette_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: voxel_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: self.light_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: occupancy_buf.as_entire_binding(),
+                },
+            ],
+        });
+        
+        // Update LightPropagation with new buffers too if needed?
+        // LightPropagation holds `voxel_buf` and `occupancy_buf` in its bindings?
+        // Let's check LightPropagation::new.
+        // It does: `self.bind_group_layout` ... `voxel_buf` ...
+        // LightPropagation needs to update its bind group as well if voxel buffer changes!
     }
 
     /// Reconfigure the surface after a window resize.
@@ -897,23 +927,4 @@ impl Renderer {
         );
     }
 
-    /// Update the voxel buffer with new data.
-    #[allow(dead_code)]
-    pub fn update_voxels(&self, gpu: &GpuContext, voxel_data: &[PackedVoxel]) {
-        let voxel_bytes = bytemuck::cast_slice::<PackedVoxel, u8>(voxel_data);
-        gpu.queue().write_buffer(&self.voxel_buf, 0, voxel_bytes);
-    }
-
-    /// Write a single voxel to the GPU buffer at the given linear index.
-    pub fn update_voxel_at(&self, gpu: &GpuContext, index: usize, voxel: PackedVoxel) {
-        let offset = (index * std::mem::size_of::<PackedVoxel>()) as u64;
-        gpu.queue()
-            .write_buffer(&self.voxel_buf, offset, bytemuck::bytes_of(&voxel));
-    }
-
-    /// Upload updated occupancy data to the GPU.
-    pub fn update_occupancy(&self, gpu: &GpuContext, data: &[u32]) {
-        gpu.queue()
-            .write_buffer(&self.occupancy_buf, 0, bytemuck::cast_slice(data));
-    }
 }

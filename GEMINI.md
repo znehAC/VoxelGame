@@ -31,6 +31,8 @@ ui.wgsl                    2D vertex/fragment shader for Interface
 > THIS RULE MUST NEVER BE BROKEN, BE TOTALLY STRICT WITH THIS.
 ## **IMPORTANT**
  - NEVER EVER write conversational commentary in code, only technical comments if needed
+ - NEVER write comments about the code, only comments about the logic
+ - USE CONTEXT WHENEVER APPROPRIATE
 > END OF RULE THAT MUST BE FOLLOWED NO MATTER WHAT
 
 ## GPU Context (src/gpu.rs)

@@ -17,7 +17,7 @@ id = "ara:grass"
 name = "Grass"
 color = "#4CAF50"
 roughness = 0.85
-noise = 0.2
+noise = 0.7
 
 [[block]]
 id = "ara:sand"

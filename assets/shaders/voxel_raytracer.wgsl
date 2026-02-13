@@ -29,6 +29,7 @@ struct HitResult {
     pos: vec3f,
     normal: vec3f,
     voxel: VoxelData,
+    min_penumbra: f32,
 }
 
 struct PointLight {
@@ -51,6 +52,7 @@ struct LightBuffer {
 const GRID_SIZE: u32 = 512u;
 const MAX_STEPS: u32 = 1024u;
 const CHUNKSi: i32 = 16;
+const CHUNK_SIZEf: f32 = 32.0;
 
 @group(0) @binding(0) var<uniform> globals: GlobalUniforms;
 @group(0) @binding(2) var t_palette: texture_2d_array<f32>;
@@ -114,6 +116,7 @@ fn ray_aabb(origin: vec3f, inv_dir: vec3f, box_min: vec3f, box_max: vec3f) -> ve
 fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) -> HitResult {
     var result: HitResult;
     result.hit = false;
+    result.min_penumbra = 1.0;
 
     // 1. Setup
     let inv_dir = 1.0 / dir;
@@ -128,12 +131,7 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
     let half_grid = i32(GRID_SIZE) / 2;
     
     let window_min = origin_voxel - vec3i(half_grid);
-    let window_max = origin_voxel + vec3i(half_grid); // Exclusive max is origin + half? Or window is centered at origin + half?
-    // Actually, let's treat world_origin as the CORNER of the atlas in world space for now?
-    // The prompt says: "world_origin uniform tells the GPU which region of the world the atlas currently represents."
-    // Usually origin = min corner.
-    // Let's assume origin is the (0,0,0) index of the atlas in world space.
-    // So valid range is [origin, origin + 512).
+    let window_max = origin_voxel + vec3i(half_grid); 
     
     let grid_min = vec3f(vec3i(i32(globals.world_origin.x), i32(globals.world_origin.y), i32(globals.world_origin.z)));
     let grid_max = grid_min + 512.0;
@@ -149,9 +147,6 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
     // Epsilon offset to enter grid safely
     var curr_pos = origin + dir * (t_curr + 0.001); 
     var cell = vec3i(floor(curr_pos));
-    
-    // No clamping to 0..512 anymore, we can be anywhere.
-    // cell = clamp(cell, vec3i(0), vec3i(i32(GRID_SIZE) - 1));
 
     var t_max = (vec3f(cell) + bound_offset - origin) * inv_dir;
     
@@ -185,8 +180,6 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
             // Rebuild State
             curr_pos = origin + dir * t_curr;
             cell = vec3i(floor(curr_pos));
-            // No clamp
-            // cell = clamp(cell, vec3i(0), vec3i(i32(GRID_SIZE) - 1));
 
             t_max = (vec3f(cell) + bound_offset - origin) * inv_dir;
             if (abs(dir.x) < 0.00001) { t_max.x = 3.402823e38; }
@@ -216,27 +209,58 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
         let idx = voxel_index(cell.x, cell.y, cell.z);
         if (voxels[idx] & 0x3FFFu) != 0u {
              result.hit = true;
-             
-             // Shadow Optimization: Early return
+
              if (shadow_mode) { return result; }
 
-             // Full Detail Calculation
              result.voxel = unpack_voxel(voxels[idx]);
 
              var t_hit = 0.0;
              if last_axis == 0u { t_hit = t_max.x - t_delta.x; }
              else if last_axis == 1u { t_hit = t_max.y - t_delta.y; }
              else { t_hit = t_max.z - t_delta.z; }
-             
+
              result.pos = origin + dir * t_hit;
-             
+
              var normal = vec3f(0.0);
              if last_axis == 0u { normal.x = -f32(step.x); }
              else if last_axis == 1u { normal.y = -f32(step.y); }
              else { normal.z = -f32(step.z); }
              result.normal = normal;
-             
+
              return result;
+        }
+
+        // --- B2. Penumbra Tracking (shadow rays only) ---
+        if shadow_mode {
+            var t_entry: f32;
+            if last_axis == 0u { t_entry = t_max.x - t_delta.x; }
+            else if last_axis == 1u { t_entry = t_max.y - t_delta.y; }
+            else { t_entry = t_max.z - t_delta.z; }
+            t_entry = max(t_entry, 0.1);
+
+            let ray_pos = origin + dir * t_entry;
+            let frac = ray_pos - vec3f(cell);
+            var min_d = 1.0;
+
+            if last_axis != 0u {
+                if (voxels[voxel_index(cell.x + 1, cell.y, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.x); }
+                if (voxels[voxel_index(cell.x - 1, cell.y, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.x); }
+            }
+            if last_axis != 1u {
+                if (voxels[voxel_index(cell.x, cell.y + 1, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.y); }
+                if (voxels[voxel_index(cell.x, cell.y - 1, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.y); }
+            }
+            if last_axis != 2u {
+                if (voxels[voxel_index(cell.x, cell.y, cell.z + 1)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.z); }
+                if (voxels[voxel_index(cell.x, cell.y, cell.z - 1)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.z); }
+            }
+
+            if min_d < 1.0 {
+                // 1060 Scaling: Use ground_color.w as quality flag (0=Low, 1=High)
+                // If ground_color.w > 0.5 (High), use 48.0. If Low, reduce to 16.0 (or disabled).
+                let penumbra_k = select(16.0, 48.0, globals.ground_color.w > 0.5);
+                result.min_penumbra = min(result.min_penumbra, penumbra_k * min_d / t_entry);
+            }
         }
 
         // --- C. Standard Step ---
@@ -287,21 +311,25 @@ fn trace_visibility(origin: vec3f, dir: vec3f, max_dist: f32) -> f32 {
     return 1.0;
 }
 
+fn trace_soft_shadow(origin: vec3f, dir: vec3f, max_dist: f32) -> f32 {
+    let result = traverse_grid(origin, dir, max_dist, true);
+    if result.hit { return 0.0; }
+    let p = clamp(result.min_penumbra, 0.0, 1.0);
+    return smoothstep(0.0, 1.0, p);
+}
+
 // --- AO & Shading ---
 
 fn get_voxel_at(pos: vec3i) -> bool {
-    // Check bounds against loaded region
     let ox = i32(globals.world_origin.x);
     let oy = i32(globals.world_origin.y);
     let oz = i32(globals.world_origin.z);
     let s = i32(GRID_SIZE);
-
     if (pos.x < ox || pos.x >= ox + s ||
         pos.y < oy || pos.y >= oy + s ||
         pos.z < oz || pos.z >= oz + s) {
-        return false; 
+        return false;
     }
-    // Idx is wrapped inside voxel_index
     let idx = voxel_index(pos.x, pos.y, pos.z);
     return (voxels[idx] & 0x3FFFu) != 0u;
 }
@@ -405,6 +433,66 @@ fn apply_selection_outline(color: vec3f, hit: HitResult, dir: vec3f) -> vec3f {
     return color;
 }
 
+// Analytical 3D chunk wireframe: intersect ray with chunk-boundary planes,
+// draw red edges where two planes meet.
+fn chunk_wireframe(origin: vec3f, dir: vec3f, max_t: f32) -> f32 {
+    let thickness = 0.08;
+    var min_t = max_t;
+
+    // X-aligned planes
+    if abs(dir.x) > 0.0001 {
+        var plane = select(floor(origin.x / CHUNK_SIZEf) * CHUNK_SIZEf,
+                           ceil(origin.x / CHUNK_SIZEf) * CHUNK_SIZEf, dir.x > 0.0);
+        let s = select(-CHUNK_SIZEf, CHUNK_SIZEf, dir.x > 0.0);
+        for (var i = 0u; i < 20u; i++) {
+            let t = (plane - origin.x) / dir.x;
+            if t < 0.001 { plane += s; continue; }
+            if t >= min_t { break; }
+            let hit = origin + dir * t;
+            let my = abs(hit.y - round(hit.y / CHUNK_SIZEf) * CHUNK_SIZEf);
+            let mz = abs(hit.z - round(hit.z / CHUNK_SIZEf) * CHUNK_SIZEf);
+            if my < thickness || mz < thickness { min_t = t; break; }
+            plane += s;
+        }
+    }
+
+    // Y-aligned planes
+    if abs(dir.y) > 0.0001 {
+        var plane = select(floor(origin.y / CHUNK_SIZEf) * CHUNK_SIZEf,
+                           ceil(origin.y / CHUNK_SIZEf) * CHUNK_SIZEf, dir.y > 0.0);
+        let s = select(-CHUNK_SIZEf, CHUNK_SIZEf, dir.y > 0.0);
+        for (var i = 0u; i < 20u; i++) {
+            let t = (plane - origin.y) / dir.y;
+            if t < 0.001 { plane += s; continue; }
+            if t >= min_t { break; }
+            let hit = origin + dir * t;
+            let mx = abs(hit.x - round(hit.x / CHUNK_SIZEf) * CHUNK_SIZEf);
+            let mz = abs(hit.z - round(hit.z / CHUNK_SIZEf) * CHUNK_SIZEf);
+            if mx < thickness || mz < thickness { min_t = t; break; }
+            plane += s;
+        }
+    }
+
+    // Z-aligned planes
+    if abs(dir.z) > 0.0001 {
+        var plane = select(floor(origin.z / CHUNK_SIZEf) * CHUNK_SIZEf,
+                           ceil(origin.z / CHUNK_SIZEf) * CHUNK_SIZEf, dir.z > 0.0);
+        let s = select(-CHUNK_SIZEf, CHUNK_SIZEf, dir.z > 0.0);
+        for (var i = 0u; i < 20u; i++) {
+            let t = (plane - origin.z) / dir.z;
+            if t < 0.001 { plane += s; continue; }
+            if t >= min_t { break; }
+            let hit = origin + dir * t;
+            let mx = abs(hit.x - round(hit.x / CHUNK_SIZEf) * CHUNK_SIZEf);
+            let my = abs(hit.y - round(hit.y / CHUNK_SIZEf) * CHUNK_SIZEf);
+            if mx < thickness || my < thickness { min_t = t; break; }
+            plane += s;
+        }
+    }
+
+    return min_t;
+}
+
 fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
     let pu = hit.voxel.id % 256u;
     let pv = hit.voxel.id / 256u;
@@ -421,33 +509,20 @@ fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
     let noisy_albedo = albedo * (1.0 - (noise_strength * noise_val * 0.5));
 
     let light_uvw = (hit.pos + hit.normal * 0.1) / vec3f(f32(GRID_SIZE));
-    // light_uvw is 0..1 in "atlas space".
-    // But hit.pos is world space.
-    // We need to map world pos to atlas UVW.
-    // (pos - origin) / size? 
-    // And handle wrapping?
-    // textureSampleLevel on 3D texture wraps by default if address mode is repeat.
-    // But we probably want linear mapping relative to origin.
-    // The Light Volume is toroidal too.
-    // So light_uvw should be (hit.pos) / GRID_SIZE.
-    // If sampler is repeat, it wraps automatically.
-    // Let's rely on sampler wrapping for now.
-    // Wait, light_uvw calcuated here assumes origin is 0.
-    // Correct UVW: (hit.pos - globals.world_origin.xyz) / 512.0?
-    // No, texture is wrapped.
-    // Just use hit.pos / 512.0. The fractional part is the UVW.
-    // But we need to ensure the integer boundary aligns.
-    // We'll stick to hit.pos / 512.0 and ensure sampler is Repeat.
-    // Check sampler in renderer.rs.
-    let voxel_light = textureSampleLevel(t_light, s_light, light_uvw, 0.0).rgb;
-    let ao = pow(get_ao(hit.pos, hit.normal), 1.0);
+    
+    // Ambient Floor & Sampling
+    let voxel_light_raw = textureSampleLevel(t_light, s_light, light_uvw, 0.0).rgb;
+    let voxel_light = max(voxel_light_raw, globals.sky_color.rgb * 0.1);
+    
+    let ao = get_ao(hit.pos, hit.normal);
 
     let ndotl = max(dot(hit.normal, -globals.sun_dir.xyz), 0.0);
     var sun_light = globals.sun_color.rgb * globals.sun_dir.w * ndotl;
 
     if ndotl > 0.0 {
-        let shadow_origin = hit.pos + hit.normal * 0.05;
-        let sun_vis = trace_visibility(shadow_origin, -globals.sun_dir.xyz, globals.sun_shadow_max);
+        // Reduced SHADOW_BIAS (0.001)
+        let shadow_origin = hit.pos + hit.normal * 0.001;
+        let sun_vis = trace_soft_shadow(shadow_origin, -globals.sun_dir.xyz, globals.sun_shadow_max);
         sun_light *= sun_vis;
     }
 
@@ -457,7 +532,9 @@ fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
         dynamic_light += evaluate_point_light(point_lights.lights[i], hit.pos, hit.normal);
     }
 
-    let total_light = sun_light + voxel_light * ao + dynamic_light;
+    // Vertex AO Tuning: Apply AO to voxel_light (indirect) only
+    // sun_light and dynamic_light are direct sources.
+    let total_light = sun_light + (voxel_light * ao) + dynamic_light;
 
     // Specular
     var specular = vec3f(0.0);
@@ -528,7 +605,20 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
     var color = vec3f(0.0);
     var velocity = vec2f(0.0);
 
-    if hit.hit {
+    let debug_grid = globals.world_origin.w > 0.5;
+    let voxel_t = select(3.402823e38, length(hit.pos - origin), hit.hit);
+
+    var wire_t = 3.402823e38;
+    if debug_grid {
+        wire_t = chunk_wireframe(origin, dir, min(voxel_t, 512.0));
+    }
+
+    if wire_t < voxel_t {
+        let wire_pos = origin + dir * wire_t;
+        let fade = 1.0 - smoothstep(0.0, 256.0, wire_t);
+        color = vec3f(1.0, 0.15, 0.1) * fade;
+        velocity = calculate_velocity(wire_pos);
+    } else if hit.hit {
         color = shade_pbr(hit, dir);
         velocity = calculate_velocity(hit.pos + hit.normal * 0.01);
     } else {

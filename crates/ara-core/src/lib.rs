@@ -36,7 +36,7 @@ pub const CHUNK_SIZE: u32 = 32;
 pub const CHUNKS_PER_AXIS: u32 = 16;
 
 /// Light volume resolution (cubic, independent of voxel grid).
-pub const LIGHT_GRID_SIZE: u32 = 64;
+pub const LIGHT_GRID_SIZE: u32 = 128;
 
 /// Max raymarching steps (512 * sqrt(3) ≈ 886).
 pub const MAX_STEPS: u32 = 1024;

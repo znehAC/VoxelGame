@@ -24,6 +24,7 @@ impl LightPropagation {
     pub fn new(
         gpu: &GpuContext,
         voxel_buf: &wgpu::Buffer,
+        occupancy_buf: &wgpu::Buffer,
         uniform_buf: &wgpu::Buffer,
         palette_tex: &wgpu::Texture,
         iterations: u32,
@@ -109,6 +110,17 @@ impl LightPropagation {
                     },
                     count: None,
                 },
+                // 5: Occupancy Buffer
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -137,6 +149,10 @@ impl LightPropagation {
                     binding: 4,
                     resource: uniform_buf.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: occupancy_buf.as_entire_binding(),
+                },
             ],
         });
 
@@ -164,6 +180,10 @@ impl LightPropagation {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: uniform_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: occupancy_buf.as_entire_binding(),
                 },
             ],
         });

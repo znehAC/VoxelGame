@@ -1,12 +1,8 @@
-const LIGHT_GRID: u32 = 64u;
-const LG: i32 = 64;
+const LIGHT_GRID: u32 = 128u;
+const LG: i32 = 128;
 const VOXEL_GRID: u32 = 512u;
-const VSCALE: u32 = 8u; // VOXEL_GRID / LIGHT_GRID
+const VSCALE: u32 = 4u; // VOXEL_GRID / LIGHT_GRID
 
-// Multiplicative attenuation factors
-// Use float math directly. no more integer approximations.
-// Multiplicative attenuation factors
-// Use float math directly. no more integer approximations.
 struct GlobalUniforms {
     view_inverse: mat4x4f,
     proj_inverse: mat4x4f,
@@ -20,19 +16,40 @@ struct GlobalUniforms {
     sky_color: vec4f,
     ground_color: vec4f,
     selected_block: vec4f,
+    prev_view_proj: mat4x4f,
+    curr_view_proj: mat4x4f,
     world_origin: vec4f,
 }
 
-const FACTOR_FACE: f32 = 0.80; // Stricter decay for indirect light (Cave darkness)
-const FACTOR_EDGE: f32 = 0.81;    // 0.9 * 0.9
-const FACTOR_CORNER: f32 = 0.729; // 0.9 * 0.9 * 0.9
-const BOUNCE_INTENSITY: f32 = 0.2; // How much sun light bounces off walls
+const FACTOR_FACE: f32 = 0.80;
+const FACTOR_EDGE: f32 = 0.81;
+const FACTOR_CORNER: f32 = 0.729;
+const BOUNCE_INTENSITY: f32 = 0.7;
+
+const CHUNKSi: i32 = 16;
+const CHUNK_SIZEf: f32 = 32.0;
 
 @group(0) @binding(0) var<storage, read> voxels: array<u32>;
 @group(0) @binding(1) var light_src: texture_3d<f32>;
 @group(0) @binding(2) var light_dst: texture_storage_3d<rgba16float, write>;
 @group(0) @binding(3) var t_palette: texture_2d_array<f32>;
 @group(0) @binding(4) var<uniform> globals: GlobalUniforms;
+@group(0) @binding(5) var<storage, read> occupancy: array<u32>;
+
+// --- Helpers ---
+
+fn chunk_wrap(c: i32) -> i32 {
+    let size = CHUNKSi;
+    return ((c % size) + size) % size;
+}
+
+fn chunk_index(cx: i32, cy: i32, cz: i32) -> u32 {
+    return u32(chunk_wrap(cz)) * u32(CHUNKSi) * u32(CHUNKSi) + u32(chunk_wrap(cy)) * u32(CHUNKSi) + u32(chunk_wrap(cx));
+}
+
+fn is_chunk_occupied(cx: i32, cy: i32, cz: i32) -> bool {
+    return occupancy[chunk_index(cx, cy, cz)] != 0u;
+}
 
 fn voxel_index(pos: vec3<u32>) -> u32 {
     return pos.z * VOXEL_GRID * VOXEL_GRID + pos.y * VOXEL_GRID + pos.x;
@@ -43,13 +60,8 @@ fn voxel_idx_i(pos: vec3i) -> u32 {
 }
 
 fn in_bounds(p: vec3i) -> bool {
-    // Toroidal world: always in bounds conceptually.
-    // But we operate on a 64^3 LOCAL grid in this compute shader.
-    // The shader is dispatched 4,4,4 workgroups of size 4,4,4 = 16,16,16 threads?
-    // Wait, typical dispatch is (64/4, 64/4, 64/4).
-    // The passed coordinates 'p' are valid in 0..63 range.
-    return true; 
-} 
+    return p.x >= 0 && p.x < LG && p.y >= 0 && p.y < LG && p.z >= 0 && p.z < LG;
+}
 
 fn wrap_lg(c: i32) -> i32 {
     let size = i32(LIGHT_GRID);
@@ -62,21 +74,11 @@ fn wrap_voxel_coord(c: i32) -> i32 {
 }
 
 fn light_to_voxel_global(p: vec3i) -> vec3i {
-     // p is 0..63 relative to ? 
-     // We need to know "where in the world" this compute thread is.
-     // This compute shader updates the ENTIRE light grid 0..63.
-     // The light grid represents the torus.
-     // So index `gid` corresponds to light voxel `gid` in the torus.
-     // To get the corresponding world voxel, we need to know the offset.
-     // Actually, we just need to sample the voxel data at the corresponding TOROIDAL index.
-     // Light Voxel L corresponds to Voxel V = L * 8 + 4.
-     // Since Voxel Grid is also toroidal 512, and 64*8 = 512, they align perfectly.
-     // So Voxel Index = (L * 8 + 4) wrapped.
-     return vec3i(
-        wrap_voxel_coord(p.x * 8 + 4),
-        wrap_voxel_coord(p.y * 8 + 4),
-        wrap_voxel_coord(p.z * 8 + 4)
-     );
+    return vec3i(
+        wrap_voxel_coord(p.x * i32(VSCALE) + i32(VSCALE) / 2),
+        wrap_voxel_coord(p.y * i32(VSCALE) + i32(VSCALE) / 2),
+        wrap_voxel_coord(p.z * i32(VSCALE) + i32(VSCALE) / 2)
+    );
 }
 
 fn light_to_voxel(p: vec3i) -> vec3i {
@@ -98,48 +100,97 @@ fn propagate_light(light: vec3f, factor: f32) -> vec3f {
     return light * factor;
 }
 
+// Unified HDDA check_sun_path
 fn check_sun_path(start_pos: vec3i, sun_dir: vec3f) -> bool {
-    let step = normalize(sun_dir);
-    // Start slightly outside the voxel center to avoid self-occlusion
-    var p = vec3f(vec3f(start_pos) + vec3f(0.5) + step * 0.7);
+    let origin_voxel = light_to_voxel(start_pos);
+    let origin = vec3f(vec3f(origin_voxel) + 0.5);
+    let dir = normalize(sun_dir); 
     
-    // Raymarch towards the sun
-    // 48 steps covers the diagonal of a 64^3 grid
-    for (var i = 0; i < 48; i++) {
-        let ip = vec3i(floor(p));
+    // Bias: Epsilon 1e-3
+    let biased_origin = origin + dir * 0.001;
+    
+    let max_dist = 512.0; 
+    
+    let inv_dir = 1.0 / dir;
+    let t_delta = abs(inv_dir);
+    let step = vec3i(sign(dir));
+    let bound_offset = vec3f(max(sign(dir), vec3f(0.0)));
+    
+    var t_curr = 0.0;
+    var curr_pos = biased_origin;
+    var cell = vec3i(floor(curr_pos));
+    
+    var t_max = (vec3f(cell) + bound_offset - biased_origin) * inv_dir;
+    
+    if (abs(dir.x) < 0.00001) { t_max.x = 3.402823e38; }
+    if (abs(dir.y) < 0.00001) { t_max.y = 3.402823e38; }
+    if (abs(dir.z) < 0.00001) { t_max.z = 3.402823e38; }
+
+    let origin_y = i32(globals.world_origin.y);
+
+    for (var i = 0u; i < 256u; i++) {
+        // --- A. Hierarchical Skip ---
+        let chunk_idx = cell >> vec3u(5u);
         
-        // 1. Reached Sky (Out of bounds) -> Visible
-        if (!in_bounds(ip)) { return true; }
+        if (!is_chunk_occupied(chunk_idx.x, chunk_idx.y, chunk_idx.z)) {
+             let min_bound = vec3f(chunk_idx << vec3u(5u));
+             let max_bound = min_bound + 32.0;
+
+             let t0 = (min_bound - biased_origin) * inv_dir;
+             let t1 = (max_bound - biased_origin) * inv_dir;
+             let t_far = max(t0, t1); 
+             let dist_to_exit = min(min(t_far.x, t_far.y), t_far.z);
+
+             t_curr = dist_to_exit + 0.005; 
+             if (t_curr > max_dist) { return true; } 
+
+             curr_pos = biased_origin + dir * t_curr;
+             cell = vec3i(floor(curr_pos));
+             t_max = (vec3f(cell) + bound_offset - biased_origin) * inv_dir;
+             if (abs(dir.x) < 0.00001) { t_max.x = 3.402823e38; }
+             if (abs(dir.y) < 0.00001) { t_max.y = 3.402823e38; }
+             if (abs(dir.z) < 0.00001) { t_max.z = 3.402823e38; }
+
+             // Toroidal Safety: Terminate if we exited Active World Y Bounds
+             if (cell.y < origin_y || cell.y >= origin_y + 512) {
+                 return true; 
+             }
+             continue;
+        }
+
+        // --- B. Voxel Intersection ---
+        // Manually wrap for lookup
+        let idx = voxel_index(vec3u(u32(wrap_voxel_coord(cell.x)), u32(wrap_voxel_coord(cell.y)), u32(wrap_voxel_coord(cell.z))));
+        if (voxels[idx] & 0x3FFFu) != 0u {
+            return false; // Occluded
+        }
         
-        // 2. Hit Solid Block -> Occluded
-        if (is_opaque_at(ip)) { return false; }
+        // --- C. Standard Step ---
+        if t_max.x < t_max.y {
+            if t_max.x < t_max.z { t_max.x += t_delta.x; cell.x += step.x; }
+            else { t_max.z += t_delta.z; cell.z += step.z; }
+        } else {
+            if t_max.y < t_max.z { t_max.y += t_delta.y; cell.y += step.y; }
+            else { t_max.z += t_delta.z; cell.z += step.z; }
+        }
         
-        // 3. Optimization: Hit an already Bright Air Voxel -> Visible
-        // If we hit air that is effectively "Sky", we can assume clear path.
-        let light = read_light(ip);
-        if (light.g > 0.8) { return true; }
-        
-        p += step;
+        let t_next = min(min(t_max.x, t_max.y), t_max.z);
+        if (t_next > max_dist) { return true; }
+
+        if (cell.y < origin_y || cell.y >= origin_y + 512) {
+             return true; 
+        }
     }
-    return true; // Reached end of loop without hitting solid
+    
+    return true;
 }
 
 fn is_sky_layer(y: u32) -> bool {
     let world_origin_y = i32(globals.world_origin.y);
-    // Top of the loaded world is origin + 512.
-    // The light grid index corresponding to that is ((origin + 512) / 8) - 1?
-    // Let's say origin is 0. Top is 511.
-    // Light coord is 511 / 8 = 63.
-    // If origin is 8. Top is 519.
-    // Light coord is 519 / 8 = 64 -> wrapped to 0.
-    // So the "Sky Layer" index is the one just below the theoretical top?
-    // Or rather, we want to inject light at the top of the CURRENT bounding box.
-    // The top world Y is `world_origin.y + 512`.
-    // The corresponding light grid index is `((world_origin.y + 511) / 8) % 64`.
-    // Let's implicitly assume world_origin is 8-aligned.
-    let top_y_world = world_origin_y + 511;
-    let target_light_y = u32(wrap_lg(top_y_world / 8));
-    return y == target_light_y;
+    let top_y_world = world_origin_y + i32(VOXEL_GRID) - 1;
+    let top_light_y = wrap_lg(top_y_world / i32(VSCALE));
+    let second_light_y = wrap_lg(top_y_world / i32(VSCALE) - 1);
+    return i32(y) == top_light_y || i32(y) == second_light_y;
 }
 
 @compute @workgroup_size(4, 4, 4)
@@ -148,7 +199,6 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Map light-grid cell to voxel-grid center sample
     let voxel_pos = vec3<u32>(light_to_voxel(vec3i(gid)));
     let packed = voxels[voxel_index(voxel_pos)];
     let material_id = packed & 0x3FFFu;
@@ -169,7 +219,7 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     var sky = vec3f(0.0);
     if is_sky_layer(gid.y) {
         let night_base = vec3f(0.02, 0.02, 0.05);
-        sky = globals.sun_color.rgb * 0.5 + night_base;
+        sky = globals.sky_color.rgb * globals.sky_color.a + night_base;
     }
 
     if material_id != 0u {
@@ -177,16 +227,9 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
-    // Air Block Logic:
-    // I am air. I gather light from my neighbors.
     let pos = vec3i(gid);
-
-    // Initial value: Any sky light falling here + any intrinsic emission (air shouldn't emit, but for completeness)
     var best = max(emit, sky);
 
-    // Neighbor Opacity Checks for occlusion logic
-    // We need to know if neighbors are opaque to block DIAGONAL propagation (leaks).
-    // But for FACE neighbors, we ALWAYS read them. If a face neighbor is a solid light source, we want its light.
     let op_nx = is_opaque_at(pos + vec3i(-1, 0, 0));
     let op_px = is_opaque_at(pos + vec3i( 1, 0, 0));
     let op_ny = is_opaque_at(pos + vec3i( 0,-1, 0));
@@ -194,28 +237,18 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let op_nz = is_opaque_at(pos + vec3i( 0, 0,-1));
     let op_pz = is_opaque_at(pos + vec3i( 0, 0, 1));
 
-    // --- 6 face neighbors ---
-    // Read unconditionally.
     best = max(best, propagate_light(read_light(pos + vec3i(-1, 0, 0)), FACTOR_FACE));
     best = max(best, propagate_light(read_light(pos + vec3i( 1, 0, 0)), FACTOR_FACE));
     best = max(best, propagate_light(read_light(pos + vec3i( 0,-1, 0)), FACTOR_FACE));
 
-    // --- Raytraced Sun Injection ---
-    // If I am AIR and I have a SOLID neighbor, check if the Sun hits that face.
-    
-    // The sun_dir vector points FROM sun TO world (e.g. Down).
-    // We need the vector FROM surface TO sun (e.g. Up).
     let to_sun = -globals.sun_dir.xyz;
 
-    // Pre-calculate sun dot products for axes
-    // We want to know if the face normal aligns with the direction TO the sun.
     let dot_nx = max(dot(vec3f( 1.0, 0.0, 0.0), to_sun), 0.0);
     let dot_px = max(dot(vec3f(-1.0, 0.0, 0.0), to_sun), 0.0);
-    let dot_ny = max(dot(vec3f( 0.0, 1.0, 0.0), to_sun), 0.0); // Floor (Up normal)
+    let dot_ny = max(dot(vec3f( 0.0, 1.0, 0.0), to_sun), 0.0);
     let dot_nz = max(dot(vec3f( 0.0, 0.0, 1.0), to_sun), 0.0);
     let dot_pz = max(dot(vec3f( 0.0, 0.0,-1.0), to_sun), 0.0);
     
-    // Optimization: Check sun path ONCE per voxel if ANY face is aligned
     var sun_visible = false;
     let needs_check = (op_nx && dot_nx > 0.0) || (op_px && dot_px > 0.0) || 
                       (op_ny && dot_ny > 0.0) || (op_nz && dot_nz > 0.0) || 
@@ -225,25 +258,21 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
         sun_visible = check_sun_path(pos, to_sun);
     }
 
-    // Injection Intensity: Boost to make the sun spot act as a powerful lamp
     let sun_boost = globals.sun_color.rgb * BOUNCE_INTENSITY;
 
     if (sun_visible) {
         if (op_nx && dot_nx > 0.0) { best = max(best, sun_boost * dot_nx); }
         if (op_px && dot_px > 0.0) { best = max(best, sun_boost * dot_px); }
-        if (op_ny && dot_ny > 0.0) { best = max(best, sun_boost * dot_ny); } // Floor lit by sun
+        if (op_ny && dot_ny > 0.0) { best = max(best, sun_boost * dot_ny); }
         if (op_nz && dot_nz > 0.0) { best = max(best, sun_boost * dot_nz); }
         if (op_pz && dot_pz > 0.0) { best = max(best, sun_boost * dot_pz); }
     }
 
-    // Vertical neighbor (no special logic anymore)
     let light_up = read_light(pos + vec3i(0, 1, 0));
     best = max(best, propagate_light(light_up, FACTOR_FACE));
     best = max(best, propagate_light(read_light(pos + vec3i( 0, 0,-1)), FACTOR_FACE));
     best = max(best, propagate_light(read_light(pos + vec3i( 0, 0, 1)), FACTOR_FACE));
 
-    // --- 12 edge neighbors ---
-    // Propagate ONLY if BOTH adjacent face directions are not opaque (open).
     if !op_nx && !op_ny { best = max(best, propagate_light(read_light(pos + vec3i(-1,-1, 0)), FACTOR_EDGE)); }
     if !op_px && !op_ny { best = max(best, propagate_light(read_light(pos + vec3i( 1,-1, 0)), FACTOR_EDGE)); }
     if !op_nx && !op_py { best = max(best, propagate_light(read_light(pos + vec3i(-1, 1, 0)), FACTOR_EDGE)); }
@@ -259,8 +288,6 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     if !op_ny && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i( 0,-1, 1)), FACTOR_EDGE)); }
     if !op_py && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i( 0, 1, 1)), FACTOR_EDGE)); }
 
-    // --- 8 corner neighbors ---
-    // Propagate ONLY if ALL THREE adjacent faces are not opaque.
     if !op_nx && !op_ny && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i(-1,-1,-1)), FACTOR_CORNER)); }
     if !op_px && !op_ny && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i( 1,-1,-1)), FACTOR_CORNER)); }
     if !op_nx && !op_py && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i(-1, 1,-1)), FACTOR_CORNER)); }
