@@ -22,7 +22,7 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use ara_core::glam;
 use ara_core::{
-    Action, BlockRegistry, CHUNKS_PER_AXIS, CHUNK_SIZE, GRID_SIZE, GlobalUniforms, InputManager,
+    Action, BlockRegistry, CHUNK_SIZE, CHUNKS_PER_AXIS, GRID_SIZE, GlobalUniforms, InputManager,
     LightBuffer, PackedVoxel, PointLight, dda_raycast,
 };
 use camera::{FpsCamera, HaltonJitter};
@@ -375,8 +375,7 @@ impl ApplicationHandler for App {
                                 let cy = p.y as usize / cs;
                                 let cz = p.z as usize / cs;
                                 let chunk_idx = cz * chunks * chunks + cy * chunks + cx;
-                                self.occupancy[chunk_idx] =
-                                    rescan_chunk(&self.voxels, cx, cy, cz);
+                                self.occupancy[chunk_idx] = rescan_chunk(&self.voxels, cx, cy, cz);
                                 renderer.update_occupancy(gpu, &self.occupancy);
                             }
                             MouseButton::Right => {
@@ -400,8 +399,7 @@ impl ApplicationHandler for App {
                                         let cx = neighbor.x as usize / cs;
                                         let cy = neighbor.y as usize / cs;
                                         let cz = neighbor.z as usize / cs;
-                                        let chunk_idx =
-                                            cz * chunks * chunks + cy * chunks + cx;
+                                        let chunk_idx = cz * chunks * chunks + cy * chunks + cx;
                                         self.occupancy[chunk_idx] = 1;
                                         renderer.update_occupancy(gpu, &self.occupancy);
                                     }
@@ -543,6 +541,7 @@ impl ApplicationHandler for App {
                             dda_raycast(&self.voxels, self.camera.position, dir, 10.0)
                                 .map(|hit| hit.grid_pos.to_array())
                         },
+                        [0.0, 0.0, 0.0], // world_origin
                         prev_view_proj_unjittered,
                         curr_view_proj_unjittered,
                     );

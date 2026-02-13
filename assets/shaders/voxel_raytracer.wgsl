@@ -13,6 +13,7 @@ struct GlobalUniforms {
     selected_block: vec4f, // xyz = pos, w = active (1.0) or inactive (0.0)
     prev_view_proj: mat4x4f,
     curr_view_proj: mat4x4f,
+    world_origin: vec4f,
 }
 
 struct VoxelData {
@@ -61,6 +62,18 @@ const CHUNKSi: i32 = 16;
 @group(1) @binding(0) var t_light: texture_3d<f32>;
 @group(1) @binding(1) var s_light: sampler;
 
+// --- Toroidal Wrapping ---
+
+fn wrap(c: i32) -> i32 {
+    let size = i32(GRID_SIZE);
+    return ((c % size) + size) % size;
+}
+
+fn chunk_wrap(c: i32) -> i32 {
+    let size = CHUNKSi;
+    return ((c % size) + size) % size;
+}
+
 // --- Helpers ---
 
 fn unpack_voxel(packed: u32) -> VoxelData {
@@ -74,17 +87,15 @@ fn unpack_voxel(packed: u32) -> VoxelData {
 }
 
 fn voxel_index(x: i32, y: i32, z: i32) -> u32 {
-    return u32(z) * GRID_SIZE * GRID_SIZE + u32(y) * GRID_SIZE + u32(x);
+    return u32(wrap(z)) * GRID_SIZE * GRID_SIZE + u32(wrap(y)) * GRID_SIZE + u32(wrap(x));
 }
 
 fn chunk_index(cx: i32, cy: i32, cz: i32) -> u32 {
-    return u32(cz) * u32(CHUNKSi) * u32(CHUNKSi) + u32(cy) * u32(CHUNKSi) + u32(cx);
+    return u32(chunk_wrap(cz)) * u32(CHUNKSi) * u32(CHUNKSi) + u32(chunk_wrap(cy)) * u32(CHUNKSi) + u32(chunk_wrap(cx));
 }
 
 fn is_chunk_occupied(cx: i32, cy: i32, cz: i32) -> bool {
-    if cx < 0 || cx >= CHUNKSi || cy < 0 || cy >= CHUNKSi || cz < 0 || cz >= CHUNKSi {
-        return false;
-    }
+    // Infinite domain, just wrap lookups
     return occupancy[chunk_index(cx, cy, cz)] != 0u;
 }
 
@@ -110,9 +121,24 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
     let step = vec3i(sign(dir));
     let bound_offset = vec3f(max(sign(dir), vec3f(0.0)));
     
-    // 2. Global Bound Check
-    let grid_size = f32(GRID_SIZE);
-    let bounds = ray_aabb(origin, inv_dir, vec3f(0.0), vec3f(grid_size));
+    // 2. Global Bound Check (Sliding Window)
+    
+    // Calculate bounds based on world_origin
+    let origin_voxel = vec3i(i32(globals.world_origin.x), i32(globals.world_origin.y), i32(globals.world_origin.z));
+    let half_grid = i32(GRID_SIZE) / 2;
+    
+    let window_min = origin_voxel - vec3i(half_grid);
+    let window_max = origin_voxel + vec3i(half_grid); // Exclusive max is origin + half? Or window is centered at origin + half?
+    // Actually, let's treat world_origin as the CORNER of the atlas in world space for now?
+    // The prompt says: "world_origin uniform tells the GPU which region of the world the atlas currently represents."
+    // Usually origin = min corner.
+    // Let's assume origin is the (0,0,0) index of the atlas in world space.
+    // So valid range is [origin, origin + 512).
+    
+    let grid_min = vec3f(vec3i(i32(globals.world_origin.x), i32(globals.world_origin.y), i32(globals.world_origin.z)));
+    let grid_max = grid_min + 512.0;
+
+    let bounds = ray_aabb(origin, inv_dir, grid_min, grid_max);
     
     if bounds.x > bounds.y || bounds.y < 0.0 || bounds.x > max_dist {
         return result;
@@ -123,7 +149,9 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
     // Epsilon offset to enter grid safely
     var curr_pos = origin + dir * (t_curr + 0.001); 
     var cell = vec3i(floor(curr_pos));
-    cell = clamp(cell, vec3i(0), vec3i(i32(GRID_SIZE) - 1));
+    
+    // No clamping to 0..512 anymore, we can be anywhere.
+    // cell = clamp(cell, vec3i(0), vec3i(i32(GRID_SIZE) - 1));
 
     var t_max = (vec3f(cell) + bound_offset - origin) * inv_dir;
     
@@ -157,7 +185,8 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
             // Rebuild State
             curr_pos = origin + dir * t_curr;
             cell = vec3i(floor(curr_pos));
-            cell = clamp(cell, vec3i(0), vec3i(i32(GRID_SIZE) - 1));
+            // No clamp
+            // cell = clamp(cell, vec3i(0), vec3i(i32(GRID_SIZE) - 1));
 
             t_max = (vec3f(cell) + bound_offset - origin) * inv_dir;
             if (abs(dir.x) < 0.00001) { t_max.x = 3.402823e38; }
@@ -175,9 +204,9 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
                 }
             }
 
-            if cell.x < 0 || cell.x >= i32(GRID_SIZE) ||
-               cell.y < 0 || cell.y >= i32(GRID_SIZE) ||
-               cell.z < 0 || cell.z >= i32(GRID_SIZE) {
+            if cell.x < i32(grid_min.x) || cell.x >= i32(grid_max.x) ||
+               cell.y < i32(grid_min.y) || cell.y >= i32(grid_max.y) ||
+               cell.z < i32(grid_min.z) || cell.z >= i32(grid_max.z) {
                 break;
             }
             continue;
@@ -237,9 +266,9 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
         let t_next = min(min(t_max.x, t_max.y), t_max.z);
         if (t_next > max_dist) { break; }
 
-        if cell.x < 0 || cell.x >= i32(GRID_SIZE) ||
-           cell.y < 0 || cell.y >= i32(GRID_SIZE) ||
-           cell.z < 0 || cell.z >= i32(GRID_SIZE) {
+        if cell.x < i32(grid_min.x) || cell.x >= i32(grid_max.x) ||
+           cell.y < i32(grid_min.y) || cell.y >= i32(grid_max.y) ||
+           cell.z < i32(grid_min.z) || cell.z >= i32(grid_max.z) {
             break;
         }
     }
@@ -261,11 +290,18 @@ fn trace_visibility(origin: vec3f, dir: vec3f, max_dist: f32) -> f32 {
 // --- AO & Shading ---
 
 fn get_voxel_at(pos: vec3i) -> bool {
-    if (pos.x < 0 || pos.x >= i32(GRID_SIZE) ||
-        pos.y < 0 || pos.y >= i32(GRID_SIZE) ||
-        pos.z < 0 || pos.z >= i32(GRID_SIZE)) {
-        return false;
+    // Check bounds against loaded region
+    let ox = i32(globals.world_origin.x);
+    let oy = i32(globals.world_origin.y);
+    let oz = i32(globals.world_origin.z);
+    let s = i32(GRID_SIZE);
+
+    if (pos.x < ox || pos.x >= ox + s ||
+        pos.y < oy || pos.y >= oy + s ||
+        pos.z < oz || pos.z >= oz + s) {
+        return false; 
     }
+    // Idx is wrapped inside voxel_index
     let idx = voxel_index(pos.x, pos.y, pos.z);
     return (voxels[idx] & 0x3FFFu) != 0u;
 }
@@ -385,6 +421,24 @@ fn shade_pbr(hit: HitResult, dir: vec3f) -> vec3f {
     let noisy_albedo = albedo * (1.0 - (noise_strength * noise_val * 0.5));
 
     let light_uvw = (hit.pos + hit.normal * 0.1) / vec3f(f32(GRID_SIZE));
+    // light_uvw is 0..1 in "atlas space".
+    // But hit.pos is world space.
+    // We need to map world pos to atlas UVW.
+    // (pos - origin) / size? 
+    // And handle wrapping?
+    // textureSampleLevel on 3D texture wraps by default if address mode is repeat.
+    // But we probably want linear mapping relative to origin.
+    // The Light Volume is toroidal too.
+    // So light_uvw should be (hit.pos) / GRID_SIZE.
+    // If sampler is repeat, it wraps automatically.
+    // Let's rely on sampler wrapping for now.
+    // Wait, light_uvw calcuated here assumes origin is 0.
+    // Correct UVW: (hit.pos - globals.world_origin.xyz) / 512.0?
+    // No, texture is wrapped.
+    // Just use hit.pos / 512.0. The fractional part is the UVW.
+    // But we need to ensure the integer boundary aligns.
+    // We'll stick to hit.pos / 512.0 and ensure sampler is Repeat.
+    // Check sampler in renderer.rs.
     let voxel_light = textureSampleLevel(t_light, s_light, light_uvw, 0.0).rgb;
     let ao = pow(get_ao(hit.pos, hit.normal), 1.0);
 

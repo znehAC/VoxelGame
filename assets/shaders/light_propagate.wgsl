@@ -20,6 +20,7 @@ struct GlobalUniforms {
     sky_color: vec4f,
     ground_color: vec4f,
     selected_block: vec4f,
+    world_origin: vec4f,
 }
 
 const FACTOR_FACE: f32 = 0.80; // Stricter decay for indirect light (Cave darkness)
@@ -42,11 +43,44 @@ fn voxel_idx_i(pos: vec3i) -> u32 {
 }
 
 fn in_bounds(p: vec3i) -> bool {
-    return p.x >= 0 && p.x < LG && p.y >= 0 && p.y < LG && p.z >= 0 && p.z < LG;
+    // Toroidal world: always in bounds conceptually.
+    // But we operate on a 64^3 LOCAL grid in this compute shader.
+    // The shader is dispatched 4,4,4 workgroups of size 4,4,4 = 16,16,16 threads?
+    // Wait, typical dispatch is (64/4, 64/4, 64/4).
+    // The passed coordinates 'p' are valid in 0..63 range.
+    return true; 
+} 
+
+fn wrap_lg(c: i32) -> i32 {
+    let size = i32(LIGHT_GRID);
+    return ((c % size) + size) % size;
+}
+
+fn wrap_voxel_coord(c: i32) -> i32 {
+    let size = i32(VOXEL_GRID);
+    return ((c % size) + size) % size;
+}
+
+fn light_to_voxel_global(p: vec3i) -> vec3i {
+     // p is 0..63 relative to ? 
+     // We need to know "where in the world" this compute thread is.
+     // This compute shader updates the ENTIRE light grid 0..63.
+     // The light grid represents the torus.
+     // So index `gid` corresponds to light voxel `gid` in the torus.
+     // To get the corresponding world voxel, we need to know the offset.
+     // Actually, we just need to sample the voxel data at the corresponding TOROIDAL index.
+     // Light Voxel L corresponds to Voxel V = L * 8 + 4.
+     // Since Voxel Grid is also toroidal 512, and 64*8 = 512, they align perfectly.
+     // So Voxel Index = (L * 8 + 4) wrapped.
+     return vec3i(
+        wrap_voxel_coord(p.x * 8 + 4),
+        wrap_voxel_coord(p.y * 8 + 4),
+        wrap_voxel_coord(p.z * 8 + 4)
+     );
 }
 
 fn light_to_voxel(p: vec3i) -> vec3i {
-    return p * i32(VSCALE) + i32(VSCALE / 2u);
+    return light_to_voxel_global(p);
 }
 
 fn is_opaque_at(p: vec3i) -> bool {
@@ -56,8 +90,8 @@ fn is_opaque_at(p: vec3i) -> bool {
 }
 
 fn read_light(p: vec3i) -> vec3f {
-    if !in_bounds(p) { return vec3f(0.0); }
-    return textureLoad(light_src, p, 0).rgb;
+    let wrapped_p = vec3i(wrap_lg(p.x), wrap_lg(p.y), wrap_lg(p.z));
+    return textureLoad(light_src, wrapped_p, 0).rgb;
 }
 
 fn propagate_light(light: vec3f, factor: f32) -> vec3f {
@@ -90,6 +124,24 @@ fn check_sun_path(start_pos: vec3i, sun_dir: vec3f) -> bool {
     return true; // Reached end of loop without hitting solid
 }
 
+fn is_sky_layer(y: u32) -> bool {
+    let world_origin_y = i32(globals.world_origin.y);
+    // Top of the loaded world is origin + 512.
+    // The light grid index corresponding to that is ((origin + 512) / 8) - 1?
+    // Let's say origin is 0. Top is 511.
+    // Light coord is 511 / 8 = 63.
+    // If origin is 8. Top is 519.
+    // Light coord is 519 / 8 = 64 -> wrapped to 0.
+    // So the "Sky Layer" index is the one just below the theoretical top?
+    // Or rather, we want to inject light at the top of the CURRENT bounding box.
+    // The top world Y is `world_origin.y + 512`.
+    // The corresponding light grid index is `((world_origin.y + 511) / 8) % 64`.
+    // Let's implicitly assume world_origin is 8-aligned.
+    let top_y_world = world_origin_y + 511;
+    let target_light_y = u32(wrap_lg(top_y_world / 8));
+    return y == target_light_y;
+}
+
 @compute @workgroup_size(4, 4, 4)
 fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= LIGHT_GRID || gid.y >= LIGHT_GRID || gid.z >= LIGHT_GRID {
@@ -115,7 +167,7 @@ fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     var sky = vec3f(0.0);
-    if gid.y == LIGHT_GRID - 1u {
+    if is_sky_layer(gid.y) {
         let night_base = vec3f(0.02, 0.02, 0.05);
         sky = globals.sun_color.rgb * 0.5 + night_base;
     }

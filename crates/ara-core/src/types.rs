@@ -40,6 +40,8 @@ pub struct GlobalUniforms {
     /// Current frame's view-projection matrix (for TAA velocity calculation).
     /// Column-major, stored as 4 Vec4s.
     pub curr_view_proj: [Vec4; 4],
+    /// World origin in voxels. (x, y, z, padding)
+    pub world_origin: Vec4,
 }
 
 impl GlobalUniforms {
@@ -58,6 +60,7 @@ impl GlobalUniforms {
         ground_color: [f32; 3],
         sun_shadow_max: f32,
         selected_block: Option<[i32; 3]>,
+        world_origin: [f32; 3],
     ) -> Self {
         Self::with_view_proj(
             view_inverse,
@@ -73,6 +76,7 @@ impl GlobalUniforms {
             ground_color,
             sun_shadow_max,
             selected_block,
+            world_origin,
             Mat4::IDENTITY.to_cols_array_2d(),
             Mat4::IDENTITY.to_cols_array_2d(),
         )
@@ -93,6 +97,7 @@ impl GlobalUniforms {
         ground_color: [f32; 3],
         sun_shadow_max: f32,
         selected_block: Option<[i32; 3]>,
+        world_origin: [f32; 3],
         prev_view_proj: [[f32; 4]; 4],
         curr_view_proj: [[f32; 4]; 4],
     ) -> Self {
@@ -135,6 +140,7 @@ impl GlobalUniforms {
                 Vec4::from_array(curr_view_proj[2]),
                 Vec4::from_array(curr_view_proj[3]),
             ],
+            world_origin: Vec4::new(world_origin[0], world_origin[1], world_origin[2], 0.0),
         }
     }
 }
@@ -327,8 +333,8 @@ mod tests {
     fn global_uniforms_layout() {
         // view_inverse (64) + proj_inverse (64) + cam_pos (16) + time+resolution+sun_shadow_max (16)
         // + sun_dir (16) + sun_color (16) + sky_color (16) + ground_color (16) + selected_block (16)
-        // + prev_view_proj (64) + curr_view_proj (64) = 368
-        assert_eq!(size_of::<GlobalUniforms>(), 368);
+        // + prev_view_proj (64) + curr_view_proj (64) + world_origin (16) = 384
+        assert_eq!(size_of::<GlobalUniforms>(), 384);
         assert_eq!(align_of::<GlobalUniforms>(), 16);
     }
 

@@ -196,12 +196,12 @@ impl Renderer {
             ],
         });
 
-        let blit_shader =
-            gpu.device()
-                .create_shader_module(wgpu::ShaderModuleDescriptor {
-                    label: Some("Blit Shader"),
-                    source: wgpu::ShaderSource::Wgsl(BLIT_SHADER_SRC.into()),
-                });
+        let blit_shader = gpu
+            .device()
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Blit Shader"),
+                source: wgpu::ShaderSource::Wgsl(BLIT_SHADER_SRC.into()),
+            });
 
         let blit_pipeline_layout =
             gpu.device()
@@ -211,33 +211,33 @@ impl Renderer {
                     push_constant_ranges: &[],
                 });
 
-        let blit_pipeline =
-            gpu.device()
-                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("Blit Pipeline"),
-                    layout: Some(&blit_pipeline_layout),
-                    vertex: wgpu::VertexState {
-                        module: &blit_shader,
-                        entry_point: Some("vs_main"),
-                        buffers: &[],
-                        compilation_options: Default::default(),
-                    },
-                    fragment: Some(wgpu::FragmentState {
-                        module: &blit_shader,
-                        entry_point: Some("fs_main"),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                        compilation_options: Default::default(),
-                    }),
-                    primitive: wgpu::PrimitiveState::default(),
-                    depth_stencil: None,
-                    multisample: wgpu::MultisampleState::default(),
-                    multiview: None,
-                    cache: None,
-                });
+        let blit_pipeline = gpu
+            .device()
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Blit Pipeline"),
+                layout: Some(&blit_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &blit_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &blit_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
 
         // Palette texture: 256x256, 2 layers, Rgba8UnormSrgb
         let palette_tex = gpu.device().create_texture(&wgpu::TextureDescriptor {
@@ -755,18 +755,36 @@ impl Renderer {
             pass.draw(0..3, 0..1);
         }
 
-        let (bt, bi, be) = (self.bloom_threshold, self.bloom_intensity, self.bloom_exposure);
+        let (bt, bi, be) = (
+            self.bloom_threshold,
+            self.bloom_intensity,
+            self.bloom_exposure,
+        );
 
         match self.aa_mode {
             AaMode::Fxaa => {
-                self.post_process
-                    .render(gpu.device(), &mut encoder, &self.final_sdr_view, None, bt, bi, be);
+                self.post_process.render(
+                    gpu.device(),
+                    &mut encoder,
+                    &self.final_sdr_view,
+                    None,
+                    bt,
+                    bi,
+                    be,
+                );
                 self.fxaa
                     .render(gpu.device(), &mut encoder, &self.final_sdr_view, &view);
             }
             AaMode::Smaa => {
-                self.post_process
-                    .render(gpu.device(), &mut encoder, &self.final_sdr_view, None, bt, bi, be);
+                self.post_process.render(
+                    gpu.device(),
+                    &mut encoder,
+                    &self.final_sdr_view,
+                    None,
+                    bt,
+                    bi,
+                    be,
+                );
                 self.smaa
                     .render(gpu.device(), &mut encoder, &self.final_sdr_view, &view);
             }
@@ -784,7 +802,9 @@ impl Renderer {
                     &mut encoder,
                     &self.final_sdr_view,
                     Some(taa_output),
-                    bt, bi, be,
+                    bt,
+                    bi,
+                    be,
                 );
                 self.blit_final_to_screen(&mut encoder, &view);
             }
@@ -802,7 +822,9 @@ impl Renderer {
                     &mut encoder,
                     &self.final_sdr_view,
                     Some(taa_output),
-                    bt, bi, be,
+                    bt,
+                    bi,
+                    be,
                 );
                 self.smaa
                     .render(gpu.device(), &mut encoder, &self.final_sdr_view, &view);
