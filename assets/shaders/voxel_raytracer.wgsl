@@ -14,6 +14,7 @@ struct GlobalUniforms {
     prev_view_proj: mat4x4f,
     curr_view_proj: mat4x4f,
     world_origin: vec4f,
+    brush_pos_radius: vec4f, // xyz = pos, w = radius
 }
 
 struct VoxelData {
@@ -243,16 +244,28 @@ fn traverse_grid(origin: vec3f, dir: vec3f, max_dist: f32, shadow_mode: bool) ->
             var min_d = 1.0;
 
             if last_axis != 0u {
-                if (voxels[voxel_index(cell.x + 1, cell.y, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.x); }
-                if (voxels[voxel_index(cell.x - 1, cell.y, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.x); }
+                if dir.x > -0.0001 {
+                    if (voxels[voxel_index(cell.x + 1, cell.y, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.x); }
+                }
+                if dir.x < 0.0001 {
+                    if (voxels[voxel_index(cell.x - 1, cell.y, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.x); }
+                }
             }
             if last_axis != 1u {
-                if (voxels[voxel_index(cell.x, cell.y + 1, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.y); }
-                if (voxels[voxel_index(cell.x, cell.y - 1, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.y); }
+                if dir.y > -0.0001 {
+                    if (voxels[voxel_index(cell.x, cell.y + 1, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.y); }
+                }
+                if dir.y < 0.0001 {
+                    if (voxels[voxel_index(cell.x, cell.y - 1, cell.z)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.y); }
+                }
             }
             if last_axis != 2u {
-                if (voxels[voxel_index(cell.x, cell.y, cell.z + 1)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.z); }
-                if (voxels[voxel_index(cell.x, cell.y, cell.z - 1)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.z); }
+                if dir.z > -0.0001 {
+                    if (voxels[voxel_index(cell.x, cell.y, cell.z + 1)] & 0x3FFFu) != 0u { min_d = min(min_d, 1.0 - frac.z); }
+                }
+                if dir.z < 0.0001 {
+                    if (voxels[voxel_index(cell.x, cell.y, cell.z - 1)] & 0x3FFFu) != 0u { min_d = min(min_d, frac.z); }
+                }
             }
 
             if min_d < 1.0 {
@@ -414,7 +427,8 @@ fn apply_selection_outline(color: vec3f, hit: HitResult, dir: vec3f) -> vec3f {
     if (globals.selected_block.w < 0.5) { return color; }
 
     let sel_pos = vec3i(globals.selected_block.xyz);
-    let voxel_pos = vec3i(floor(hit.pos - dir * 0.001));
+    // Use +dir to get the voxel INSIDE the hit surface (the solid block)
+    let voxel_pos = vec3i(floor(hit.pos + dir * 0.001));
 
     if (voxel_pos.x != sel_pos.x || voxel_pos.y != sel_pos.y || voxel_pos.z != sel_pos.z) {
         return color;
@@ -592,6 +606,20 @@ struct FragmentOutput {
     @location(1) velocity: vec2f,
 }
 
+fn sphere_intersect(origin: vec3f, dir: vec3f, center: vec3f, radius: f32) -> f32 {
+    let l = center - origin;
+    let tca = dot(l, dir);
+    let d2 = dot(l, l) - tca * tca;
+    let r2 = radius * radius;
+    if (d2 > r2) { return 3.402823e38; }
+    let thc = sqrt(r2 - d2);
+    let t0 = tca - thc;
+    let t1 = tca + thc;
+    if (t0 > 0.0) { return t0; }
+    if (t1 > 0.0) { return t1; }
+    return 3.402823e38;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> FragmentOutput {
     let clip = vec4f(in.ndc.x, in.ndc.y, 1.0, 1.0);
@@ -613,16 +641,43 @@ fn fs_main(in: VertexOutput) -> FragmentOutput {
         wire_t = chunk_wireframe(origin, dir, min(voxel_t, 512.0));
     }
 
+    var base_t = 3.402823e38;
+
     if wire_t < voxel_t {
         let wire_pos = origin + dir * wire_t;
         let fade = 1.0 - smoothstep(0.0, 256.0, wire_t);
         color = vec3f(1.0, 0.15, 0.1) * fade;
         velocity = calculate_velocity(wire_pos);
+        base_t = wire_t;
     } else if hit.hit {
         color = shade_pbr(hit, dir);
         velocity = calculate_velocity(hit.pos + hit.normal * 0.01);
+        base_t = voxel_t;
     } else {
         color = sky(dir);
+        base_t = 3.402823e38; // Sky is infinitely far
+    }
+
+    // Brush Sphere Visualization
+    let brush_r = globals.brush_pos_radius.w;
+    if (brush_r > 0.0) {
+        let brush_pos = globals.brush_pos_radius.xyz;
+        let st = sphere_intersect(origin, dir, brush_pos, brush_r);
+        
+        if (st < base_t) {
+            // Draw sphere overlay
+            // Simple rim lighting/fresnel effect for 3D appearance
+            let sphere_hit_pos = origin + dir * st;
+            let sphere_normal = normalize(sphere_hit_pos - brush_pos);
+            let ndotv = max(dot(sphere_normal, -dir), 0.0);
+            let rim = pow(1.0 - ndotv, 3.0);
+            
+            let brush_color = vec3f(0.2, 0.8, 1.0); // Cyan brush
+            let alpha = 0.3 + 0.4 * rim; // More opaque at edges
+            
+            color = mix(color, brush_color, alpha);
+            // Don't update velocity for the ghost sphere, let TAA blur it slightly or use background velocity
+        }
     }
 
     return FragmentOutput(vec4f(color, 1.0), velocity);

@@ -37,4 +37,5 @@ pollster = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 bytemuck = { workspace = true }
+arrayvec = "0.7"
 image = "0.25.9"

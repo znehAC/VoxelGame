@@ -19,6 +19,7 @@ struct GlobalUniforms {
     prev_view_proj: mat4x4f,
     curr_view_proj: mat4x4f,
     world_origin: vec4f,
+    brush_pos_radius: vec4f,
 }
 
 const FACTOR_FACE: f32 = 0.80;

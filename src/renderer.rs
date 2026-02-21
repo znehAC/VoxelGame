@@ -97,6 +97,9 @@ impl Renderer {
         bloom_threshold: f32,
         bloom_intensity: f32,
         bloom_exposure: f32,
+        font_atlas: &[u8],
+        font_atlas_w: u32,
+        font_atlas_h: u32,
     ) -> Self {
         let caps = surface.get_capabilities(gpu.adapter());
         let format = caps
@@ -145,7 +148,7 @@ impl Renderer {
         let final_sdr_view = final_sdr_texture.create_view(&Default::default());
 
         // Initialize UI System
-        let ui_system = UiSystem::new(gpu, format);
+        let ui_system = UiSystem::new(gpu, format, font_atlas, font_atlas_w, font_atlas_h);
 
         // Initialize Blit Pipeline (cached, not recreated per frame)
         let blit_bind_group_layout =
@@ -875,6 +878,19 @@ impl Renderer {
         output.present();
 
         Ok(())
+    }
+
+    /// Forward picker hit test to UI system.
+    pub fn picker_hit_test(
+        &self,
+        mouse_x: f32,
+        mouse_y: f32,
+        screen_w: f32,
+        screen_h: f32,
+        block_count: usize,
+    ) -> Option<u16> {
+        self.ui_system
+            .picker_hit_test(mouse_x, mouse_y, screen_w, screen_h, block_count)
     }
 
     /// Reload the palette texture with new data.

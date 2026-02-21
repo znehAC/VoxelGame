@@ -23,37 +23,23 @@ fn voxel_index(x: i32, y: i32, z: i32) -> usize {
 
 /// Cast a ray through the voxel grid using DDA traversal.
 ///
-/// Returns the first non-air voxel hit, or `None` if the ray exits the grid.
+/// Returns the first non-air voxel hit, or `None` if the ray exceeds `max_dist`.
+/// Wraps coordinates modulo `GRID_SIZE` for toroidal topology.
 pub fn dda_raycast(
     voxels: &[PackedVoxel],
     origin: Vec3,
     dir: Vec3,
     max_dist: f32,
 ) -> Option<RayHit> {
-    let gs = GRID_SIZE as f32;
     let inv_dir = 1.0 / dir;
 
-    // AABB intersection with [0, GRID_SIZE]^3
-    let t0 = -origin * inv_dir;
-    let t1 = (Vec3::splat(gs) - origin) * inv_dir;
-    let tmin = t0.min(t1);
-    let tmax = t0.max(t1);
-    let t_enter = tmin.x.max(tmin.y).max(tmin.z);
-    let t_exit = tmax.x.min(tmax.y).min(tmax.z);
-
-    if t_enter > t_exit || t_exit < 0.0 || t_enter > max_dist {
-        return None;
-    }
-
-    let t_enter = t_enter.max(0.0);
-    let entry = origin + dir * (t_enter + 0.001);
-
     // DDA setup
-    let gi = GRID_SIZE as i32;
+    // Use floor() to get the integer cell coordinate.
+    // Note: We do NOT clamp to [0, GRID_SIZE-1] because the world is infinite/toroidal.
     let mut cell = IVec3::new(
-        (entry.x.floor() as i32).clamp(0, gi - 1),
-        (entry.y.floor() as i32).clamp(0, gi - 1),
-        (entry.z.floor() as i32).clamp(0, gi - 1),
+        origin.x.floor() as i32,
+        origin.y.floor() as i32,
+        origin.z.floor() as i32,
     );
 
     let step = IVec3::new(
@@ -68,95 +54,97 @@ pub fn dda_raycast(
         (1.0 / dir.z).abs(),
     );
 
+    // t_max: distance to the next voxel boundary on each axis
+    // For negative direction, we measure distance to the current cell wall (cell.x).
+    // For positive direction, we measure distance to the next cell wall (cell.x + 1.0).
+    // We use (cell as f32) directly, which works for any integer coordinate.
     let mut t_max = Vec3::new(
         if dir.x > 0.0 {
-            (cell.x as f32 + 1.0 - entry.x) * inv_dir.x.abs()
+            (cell.x as f32 + 1.0 - origin.x) * inv_dir.x.abs()
         } else {
-            (entry.x - cell.x as f32) * inv_dir.x.abs()
+            (origin.x - cell.x as f32) * inv_dir.x.abs()
         },
         if dir.y > 0.0 {
-            (cell.y as f32 + 1.0 - entry.y) * inv_dir.y.abs()
+            (cell.y as f32 + 1.0 - origin.y) * inv_dir.y.abs()
         } else {
-            (entry.y - cell.y as f32) * inv_dir.y.abs()
+            (origin.y - cell.y as f32) * inv_dir.y.abs()
         },
         if dir.z > 0.0 {
-            (cell.z as f32 + 1.0 - entry.z) * inv_dir.z.abs()
+            (cell.z as f32 + 1.0 - origin.z) * inv_dir.z.abs()
         } else {
-            (entry.z - cell.z as f32) * inv_dir.z.abs()
+            (origin.z - cell.z as f32) * inv_dir.z.abs()
         },
     );
 
+    // Helper for wrapped lookup
+    let gs = GRID_SIZE as i32;
+    let get_voxel = |c: IVec3| -> PackedVoxel {
+        let x = ((c.x % gs) + gs) % gs;
+        let y = ((c.y % gs) + gs) % gs;
+        let z = ((c.z % gs) + gs) % gs;
+        voxels[voxel_index(x, y, z)]
+    };
+
     // Check starting cell
-    let packed = voxels[voxel_index(cell.x, cell.y, cell.z)];
+    let packed = get_voxel(cell);
     if !packed.is_air() {
-        // Entry normal from AABB face
-        let normal = if t_enter > 0.0 {
-            if tmin.x >= tmin.y && tmin.x >= tmin.z {
-                IVec3::new(-step.x, 0, 0)
-            } else if tmin.y >= tmin.x && tmin.y >= tmin.z {
-                IVec3::new(0, -step.y, 0)
-            } else {
-                IVec3::new(0, 0, -step.z)
-            }
+        // Since we start inside a solid voxel, the normal is undefined or pointing back at the ray origin.
+        // A reasonable fallback is to return the normal of the face we *would* have entered.
+        // Or simply -direction.
+        let a = dir.abs();
+        let normal = if a.x >= a.y && a.x >= a.z {
+            IVec3::new(-step.x, 0, 0)
+        } else if a.y >= a.x && a.y >= a.z {
+            IVec3::new(0, -step.y, 0)
         } else {
-            // Camera inside solid voxel
-            let a = dir.abs();
-            if a.x >= a.y && a.x >= a.z {
-                IVec3::new(-step.x, 0, 0)
-            } else if a.y >= a.x && a.y >= a.z {
-                IVec3::new(0, -step.y, 0)
-            } else {
-                IVec3::new(0, 0, -step.z)
-            }
+            IVec3::new(0, 0, -step.z)
         };
 
+        // For the index, we must return the wrapped index, but the grid_pos is the "unwrapped" world coordinate.
+        let x = ((cell.x % gs) + gs) % gs;
+        let y = ((cell.y % gs) + gs) % gs;
+        let z = ((cell.z % gs) + gs) % gs;
+
         return Some(RayHit {
-            index: voxel_index(cell.x, cell.y, cell.z),
+            index: voxel_index(x, y, z),
             grid_pos: cell,
             normal,
         });
     }
 
+    let mut t_curr = 0.0;
     for _ in 0..MAX_STEPS {
         // Step along axis with smallest t_max
         let last_axis;
         if t_max.x < t_max.y {
             if t_max.x < t_max.z {
                 cell.x += step.x;
+                t_curr = t_max.x;
                 t_max.x += t_delta.x;
                 last_axis = 0u32;
             } else {
                 cell.z += step.z;
+                t_curr = t_max.z;
                 t_max.z += t_delta.z;
                 last_axis = 2;
             }
         } else if t_max.y < t_max.z {
             cell.y += step.y;
+            t_curr = t_max.y;
             t_max.y += t_delta.y;
             last_axis = 1;
         } else {
             cell.z += step.z;
+            t_curr = t_max.z;
             t_max.z += t_delta.z;
             last_axis = 2;
         }
 
-        // Bounds check
-        if cell.x < 0 || cell.x >= gi || cell.y < 0 || cell.y >= gi || cell.z < 0 || cell.z >= gi
-        {
+        if t_curr > max_dist {
             break;
         }
 
-        // Distance check: t from entry for the crossed boundary
-        let t_crossed = match last_axis {
-            0 => t_max.x - t_delta.x,
-            1 => t_max.y - t_delta.y,
-            _ => t_max.z - t_delta.z,
-        };
-        if t_enter + t_crossed > max_dist {
-            break;
-        }
-
-        let packed = voxels[voxel_index(cell.x, cell.y, cell.z)];
+        let packed = get_voxel(cell);
         if !packed.is_air() {
             let normal = match last_axis {
                 0 => IVec3::new(-step.x, 0, 0),
@@ -164,8 +152,12 @@ pub fn dda_raycast(
                 _ => IVec3::new(0, 0, -step.z),
             };
 
+            let x = ((cell.x % gs) + gs) % gs;
+            let y = ((cell.y % gs) + gs) % gs;
+            let z = ((cell.z % gs) + gs) % gs;
+
             return Some(RayHit {
-                index: voxel_index(cell.x, cell.y, cell.z),
+                index: voxel_index(x, y, z),
                 grid_pos: cell,
                 normal,
             });

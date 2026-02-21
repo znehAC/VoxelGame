@@ -161,6 +161,7 @@ name = "ara"
 version = "0.1.0"
 dependencies = [
  "ara-core",
+ "arrayvec",
  "bytemuck",
  "env_logger",
  "image",

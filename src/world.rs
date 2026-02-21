@@ -1,5 +1,8 @@
 //! World streaming: GPU terrain generation + chunk management.
 
+use std::sync::mpsc;
+use std::sync::Arc;
+
 use ara_core::glam::{IVec3, Vec3};
 use ara_core::{CHUNK_SIZE, CHUNKS_PER_AXIS, GRID_SIZE};
 use log::info;
@@ -9,6 +12,10 @@ use crate::gpu::GpuContext;
 const VOXEL_BUF_SIZE: u64 = (GRID_SIZE as u64) * (GRID_SIZE as u64) * (GRID_SIZE as u64) * 4;
 const OCCUPANCY_COUNT: u32 = CHUNKS_PER_AXIS * CHUNKS_PER_AXIS * CHUNKS_PER_AXIS;
 const OCCUPANCY_BUF_SIZE: u64 = OCCUPANCY_COUNT as u64 * 4;
+
+const MAX_PACK_CHUNKS: u32 = 16;
+const CHUNK_VOL: u32 = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
+const PACK_BUF_SIZE: u64 = MAX_PACK_CHUNKS as u64 * CHUNK_VOL as u64 * 4;
 
 /// Push constant layout matching terrain_gen.wgsl ChunkParams.
 #[repr(C)]
@@ -20,22 +27,75 @@ struct ChunkParams {
     pad: i32,
 }
 
+/// Push constant layout matching brush_compute.wgsl BrushParams.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct BrushParams {
+    center_x: i32,
+    center_y: i32,
+    center_z: i32,
+    radius: f32,
+    material: u32,
+    shape: u32,
+    pad1: u32,
+    pad2: u32,
+}
+
+/// Push constant layout matching chunk_pack.wgsl PackParams.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct PackParams {
+    origin_x: u32,
+    origin_y: u32,
+    origin_z: u32,
+    chunk_index: u32,
+}
+
+struct ReadbackTask {
+    map_rx: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    staging_buf: Arc<wgpu::Buffer>,
+    data_len: usize,
+    chunks: Vec<IVec3>,
+}
+
+struct ReadbackResult {
+    packed_data: Vec<u32>,
+    chunks: Vec<IVec3>,
+}
+
 pub struct WorldManager {
     voxel_buf_a: wgpu::Buffer,
     voxel_buf_b: wgpu::Buffer,
     occupancy_buf: wgpu::Buffer,
     dirty_chunks_buf: wgpu::Buffer,
-    
+
     terrain_pipeline: wgpu::ComputePipeline,
     terrain_bind_group_a: wgpu::BindGroup,
     terrain_bind_group_b: wgpu::BindGroup,
+
+    brush_pipeline: wgpu::ComputePipeline,
 
     physics_pipeline: wgpu::ComputePipeline,
     physics_bind_group_ab: wgpu::BindGroup,
     physics_bind_group_ba: wgpu::BindGroup,
 
+    // Chunk pack readback
+    pack_pipeline: wgpu::ComputePipeline,
+    pack_bind_group_a: wgpu::BindGroup,
+    pack_bind_group_b: wgpu::BindGroup,
+    pack_buf: wgpu::Buffer,
+    pack_staging_buf: Arc<wgpu::Buffer>,
+
     world_origin: IVec3,
-    current_buffer_index: usize, // 0 = A, 1 = B
+    current_buffer_index: usize,
+
+    // Worker thread communication
+    worker_task_tx: mpsc::Sender<ReadbackTask>,
+    worker_result_rx: mpsc::Receiver<ReadbackResult>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
+    readback_in_flight: bool,
+    readback_queued: bool,
+    dirty_readback_chunks: Vec<IVec3>,
 }
 
 impl WorldManager {
@@ -45,60 +105,64 @@ impl WorldManager {
         let voxel_buf_a = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ara Voxel SSBO A"),
             size: VOXEL_BUF_SIZE,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let voxel_buf_b = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ara Voxel SSBO B"),
             size: VOXEL_BUF_SIZE,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         let occupancy_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ara Occupancy SSBO"),
             size: OCCUPANCY_BUF_SIZE,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_DST
+                | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        
-        // Dirty chunks buffer - simple list of indices or flags
+
         let dirty_chunks_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ara Dirty Chunks SSBO"),
-            size: OCCUPANCY_BUF_SIZE, // Enough for one flag/index per chunk
+            size: OCCUPANCY_BUF_SIZE,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         // --- Terrain Gen Pipeline ---
 
-        let terrain_bg_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Ara Terrain Gen BGL"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+        let terrain_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Ara Terrain Gen BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::COMPUTE,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Storage { read_only: false },
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
-                ],
-            });
+                    count: None,
+                },
+            ],
+        });
 
         let terrain_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Ara Terrain Gen BG A"),
@@ -154,12 +218,36 @@ impl WorldManager {
             cache: None,
         });
 
+        // --- Brush Pipeline ---
+        let brush_shader_src = include_str!("../assets/shaders/brush_compute.wgsl");
+        let brush_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Ara Brush Shader"),
+            source: wgpu::ShaderSource::Wgsl(brush_shader_src.into()),
+        });
+
+        let brush_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Ara Brush Pipeline Layout"),
+            bind_group_layouts: &[&terrain_bg_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..std::mem::size_of::<BrushParams>() as u32,
+            }],
+        });
+
+        let brush_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Ara Brush Pipeline"),
+            layout: Some(&brush_layout),
+            module: &brush_shader,
+            entry_point: Some("apply_brush"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
         // --- Physics Pipeline ---
 
         let physics_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Ara Physics BGL"),
             entries: &[
-                // Binding 0: Source Voxels (Read-Only)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -170,7 +258,6 @@ impl WorldManager {
                     },
                     count: None,
                 },
-                // Binding 1: Destination Voxels (Read-Write)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -181,7 +268,6 @@ impl WorldManager {
                     },
                     count: None,
                 },
-                // Binding 2: Dirty Chunks (Read-Write)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -195,7 +281,6 @@ impl WorldManager {
             ],
         });
 
-        // AB: Read A, Write B
         let physics_bind_group_ab = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Ara Physics BG AB"),
             layout: &physics_bg_layout,
@@ -215,7 +300,6 @@ impl WorldManager {
             ],
         });
 
-        // BA: Read B, Write A
         let physics_bind_group_ba = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Ara Physics BG BA"),
             layout: &physics_bg_layout,
@@ -256,6 +340,115 @@ impl WorldManager {
             cache: None,
         });
 
+        // --- Chunk Pack Pipeline ---
+
+        let pack_bg_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Ara Chunk Pack BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let pack_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ara Chunk Pack SSBO"),
+            size: PACK_BUF_SIZE,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+
+        let pack_staging_buf = Arc::new(device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ara Chunk Pack Staging"),
+            size: PACK_BUF_SIZE,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        }));
+
+        let pack_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Ara Chunk Pack BG A"),
+            layout: &pack_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: voxel_buf_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: pack_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let pack_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Ara Chunk Pack BG B"),
+            layout: &pack_bg_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: voxel_buf_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: pack_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let pack_shader_src = include_str!("../assets/shaders/chunk_pack.wgsl");
+        let pack_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Ara Chunk Pack Shader"),
+            source: wgpu::ShaderSource::Wgsl(pack_shader_src.into()),
+        });
+
+        let pack_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Ara Chunk Pack Pipeline Layout"),
+            bind_group_layouts: &[&pack_bg_layout],
+            push_constant_ranges: &[wgpu::PushConstantRange {
+                stages: wgpu::ShaderStages::COMPUTE,
+                range: 0..std::mem::size_of::<PackParams>() as u32,
+            }],
+        });
+
+        let pack_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Ara Chunk Pack Pipeline"),
+            layout: Some(&pack_layout),
+            module: &pack_shader,
+            entry_point: Some("pack_chunk"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // --- Readback Worker Thread ---
+
+        let (task_tx, task_rx) = mpsc::channel::<ReadbackTask>();
+        let (result_tx, result_rx) = mpsc::channel::<ReadbackResult>();
+        let worker_device = gpu.device_arc();
+
+        let worker_handle = std::thread::Builder::new()
+            .name("readback-worker".into())
+            .spawn(move || {
+                readback_worker(worker_device, task_rx, result_tx);
+            })
+            .expect("Failed to spawn readback worker thread");
+
         Self {
             voxel_buf_a,
             voxel_buf_b,
@@ -264,11 +457,23 @@ impl WorldManager {
             terrain_pipeline,
             terrain_bind_group_a,
             terrain_bind_group_b,
+            brush_pipeline,
             physics_pipeline,
             physics_bind_group_ab,
             physics_bind_group_ba,
+            pack_pipeline,
+            pack_bind_group_a,
+            pack_bind_group_b,
+            pack_buf,
+            pack_staging_buf,
             world_origin: IVec3::ZERO,
             current_buffer_index: 0,
+            worker_task_tx: task_tx,
+            worker_result_rx: result_rx,
+            worker_handle: Some(worker_handle),
+            readback_in_flight: false,
+            readback_queued: false,
+            dirty_readback_chunks: Vec::new(),
         }
     }
 
@@ -276,7 +481,6 @@ impl WorldManager {
     pub fn generate_initial_chunks(&mut self, gpu: &GpuContext, player_pos: Vec3) {
         self.world_origin = compute_origin(player_pos);
 
-        // Clear occupancy
         let zeros = vec![0u8; OCCUPANCY_BUF_SIZE as usize];
         gpu.queue().write_buffer(&self.occupancy_buf, 0, &zeros);
 
@@ -343,7 +547,6 @@ impl WorldManager {
         let cs = CHUNK_SIZE as i32;
         let cpa = CHUNKS_PER_AXIS as i32;
 
-        // Old range in chunk coordinates
         let old_chunk_min = IVec3::new(
             floor_div(old_origin.x, cs),
             floor_div(old_origin.y, cs),
@@ -351,7 +554,6 @@ impl WorldManager {
         );
         let old_chunk_max = old_chunk_min + IVec3::splat(cpa);
 
-        // New range in chunk coordinates
         let new_chunk_min = IVec3::new(
             floor_div(new_origin.x, cs),
             floor_div(new_origin.y, cs),
@@ -383,7 +585,6 @@ impl WorldManager {
             for cz in new_chunk_min.z..new_chunk_max.z {
                 for cy in new_chunk_min.y..new_chunk_max.y {
                     for cx in new_chunk_min.x..new_chunk_max.x {
-                        // Skip chunks that were already in the old range
                         if cx >= old_chunk_min.x
                             && cx < old_chunk_max.x
                             && cy >= old_chunk_min.y
@@ -394,12 +595,10 @@ impl WorldManager {
                             continue;
                         }
 
-                        // Clear occupancy for this chunk slot
                         let wcx = ((cx % cpa) + cpa) % cpa;
                         let wcy = ((cy % cpa) + cpa) % cpa;
                         let wcz = ((cz % cpa) + cpa) % cpa;
-                        let occ_idx =
-                            (wcz * cpa * cpa + wcy * cpa + wcx) as u64 * 4;
+                        let occ_idx = (wcz * cpa * cpa + wcy * cpa + wcx) as u64 * 4;
                         gpu.queue()
                             .write_buffer(&self.occupancy_buf, occ_idx, &[0u8; 4]);
 
@@ -413,6 +612,7 @@ impl WorldManager {
                         pass.set_push_constants(0, bytemuck::bytes_of(&params));
                         pass.dispatch_workgroups(8, 8, 8);
                         new_chunk_count += 1;
+                        self.dirty_readback_chunks.push(IVec3::new(cx, cy, cz));
                     }
                 }
             }
@@ -432,9 +632,6 @@ impl WorldManager {
     }
 
     /// Dispatch physics simulation.
-    ///
-    /// Reads from current buffer, writes to next buffer.
-    /// Swaps current buffer after dispatch.
     pub fn dispatch_physics(&mut self, encoder: &mut wgpu::CommandEncoder) {
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -443,30 +640,16 @@ impl WorldManager {
             });
 
             pass.set_pipeline(&self.physics_pipeline);
-            
-            // If current is A (0), we want AB (Read A, Write B).
-            // If current is B (1), we want BA (Read B, Write A).
+
             let bg = if self.current_buffer_index == 0 {
                 &self.physics_bind_group_ab
             } else {
                 &self.physics_bind_group_ba
             };
-            
+
             pass.set_bind_group(0, bg, &[]);
-            
-            // Dispatch 0 workgroups for now (No-op)
             pass.dispatch_workgroups(0, 0, 0);
         }
-
-        // If we dispatched work, we would swap here.
-        // For now, since we dispatch 0, we effectively do nothing.
-        // But to test logic, let's NOT swap if workgroups is 0,
-        // OR follow instruction "For now with 0 workgroups dispatched, buffer A stays current".
-        // This implies I should NOT swap if I don't dispatch.
-        // However, if I implemented the swap, I would do:
-        // self.current_buffer_index = 1 - self.current_buffer_index;
-        
-        // Leaving swap logic commented out or guarded for now.
     }
 
     pub fn voxel_buf(&self) -> &wgpu::Buffer {
@@ -488,6 +671,323 @@ impl WorldManager {
             self.world_origin.y as f32,
             self.world_origin.z as f32,
         ]
+    }
+
+    /// World origin as IVec3.
+    pub fn world_origin_ivec3(&self) -> IVec3 {
+        self.world_origin
+    }
+
+    /// Dispatch compute shader modification over a target volume.
+    pub fn dispatch_brush(
+        &mut self,
+        gpu: &GpuContext,
+        center: IVec3,
+        radius: f32,
+        material: u32,
+        is_sphere: bool,
+    ) {
+        let mut encoder = gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Ara Brush Compute Encoder"),
+            });
+
+        let bg = if self.current_buffer_index == 0 {
+            &self.terrain_bind_group_a
+        } else {
+            &self.terrain_bind_group_b
+        };
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Ara Brush Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.brush_pipeline);
+            pass.set_bind_group(0, bg, &[]);
+
+            let r_int = if is_sphere {
+                radius as i32
+            } else {
+                ((radius as i32) - 1) / 2
+            };
+
+            let width = (r_int * 2 + 1) as u32;
+
+            let params = BrushParams {
+                center_x: center.x,
+                center_y: center.y,
+                center_z: center.z,
+                radius,
+                material,
+                shape: if is_sphere { 1 } else { 0 },
+                pad1: 0,
+                pad2: 0,
+            };
+
+            pass.set_push_constants(0, bytemuck::bytes_of(&params));
+
+            let wg_count = (width + 3) / 4;
+            pass.dispatch_workgroups(wg_count, wg_count, wg_count);
+        }
+
+        gpu.queue().submit(std::iter::once(encoder.finish()));
+
+        let cs = CHUNK_SIZE as f32;
+        let c_min = IVec3::new(
+            f32::floor((center.x as f32 - radius) / cs) as i32,
+            f32::floor((center.y as f32 - radius) / cs) as i32,
+            f32::floor((center.z as f32 - radius) / cs) as i32,
+        );
+        let c_max = IVec3::new(
+            f32::floor((center.x as f32 + radius) / cs) as i32,
+            f32::floor((center.y as f32 + radius) / cs) as i32,
+            f32::floor((center.z as f32 + radius) / cs) as i32,
+        );
+
+        for cz in c_min.z..=c_max.z {
+            for cy in c_min.y..=c_max.y {
+                for cx in c_min.x..=c_max.x {
+                    self.dirty_readback_chunks.push(IVec3::new(cx, cy, cz));
+                }
+            }
+        }
+    }
+
+    /// Initiate async packed readback of dirty chunks. Returns immediately.
+    pub fn request_readback(&mut self, gpu: &GpuContext, full_copy: bool) {
+        self.readback_queued = true;
+        if self.readback_in_flight {
+            return;
+        }
+        self.readback_queued = false;
+
+        if full_copy {
+            // Full copy uses dedicated temporary path (see initial_blocking_readback)
+            return;
+        }
+
+        let chunks = std::mem::take(&mut self.dirty_readback_chunks);
+        if chunks.is_empty() {
+            return;
+        }
+
+        // Deduplicate chunks
+        let mut unique_chunks: Vec<IVec3> = Vec::with_capacity(chunks.len());
+        for c in &chunks {
+            if !unique_chunks.contains(c) {
+                unique_chunks.push(*c);
+            }
+        }
+
+        // Cap at MAX_PACK_CHUNKS per readback; overflow stays queued for next frame
+        if unique_chunks.len() > MAX_PACK_CHUNKS as usize {
+            let overflow = unique_chunks.split_off(MAX_PACK_CHUNKS as usize);
+            self.dirty_readback_chunks = overflow;
+            self.readback_queued = true;
+        }
+
+        let chunk_count = unique_chunks.len() as u32;
+        let cpa = CHUNKS_PER_AXIS as i32;
+
+        // Dispatch pack compute shader per chunk
+        let mut encoder = gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Ara Pack Readback Encoder"),
+            });
+
+        let pack_bg = if self.current_buffer_index == 0 {
+            &self.pack_bind_group_a
+        } else {
+            &self.pack_bind_group_b
+        };
+
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Ara Chunk Pack Pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pack_pipeline);
+            pass.set_bind_group(0, pack_bg, &[]);
+
+            for (i, chunk) in unique_chunks.iter().enumerate() {
+                let wcx = (((chunk.x % cpa) + cpa) % cpa) as u32;
+                let wcy = (((chunk.y % cpa) + cpa) % cpa) as u32;
+                let wcz = (((chunk.z % cpa) + cpa) % cpa) as u32;
+
+                let params = PackParams {
+                    origin_x: wcx * CHUNK_SIZE,
+                    origin_y: wcy * CHUNK_SIZE,
+                    origin_z: wcz * CHUNK_SIZE,
+                    chunk_index: i as u32,
+                };
+
+                pass.set_push_constants(0, bytemuck::bytes_of(&params));
+                pass.dispatch_workgroups(8, 8, 8);
+            }
+        }
+
+        // DMA: pack_buf → pack_staging_buf (only the used portion)
+        let copy_size = chunk_count as u64 * CHUNK_VOL as u64 * 4;
+        encoder.copy_buffer_to_buffer(&self.pack_buf, 0, &self.pack_staging_buf, 0, copy_size);
+
+        gpu.queue().submit(std::iter::once(encoder.finish()));
+
+        // Map the staging buffer asynchronously
+        let slice = self.pack_staging_buf.slice(..copy_size);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        // Send task to worker thread
+        let task = ReadbackTask {
+            map_rx: rx,
+            staging_buf: Arc::clone(&self.pack_staging_buf),
+            data_len: copy_size as usize,
+            chunks: unique_chunks,
+        };
+
+        if self.worker_task_tx.send(task).is_ok() {
+            self.readback_in_flight = true;
+        }
+    }
+
+    /// Check if worker completed readback. Scatter packed chunks into `voxels_cpu`.
+    pub fn poll_readback(&mut self, gpu: &GpuContext, voxels_cpu: &mut [u32]) -> bool {
+        if let Ok(result) = self.worker_result_rx.try_recv() {
+            self.readback_in_flight = false;
+
+            let grid_size = (CHUNK_SIZE * CHUNKS_PER_AXIS) as usize;
+            let cs = CHUNK_SIZE as usize;
+            let cpa = CHUNKS_PER_AXIS as i32;
+            let chunk_vol = CHUNK_VOL as usize;
+
+            for (i, chunk) in result.chunks.iter().enumerate() {
+                let wcx = (((chunk.x % cpa) + cpa) % cpa) as usize;
+                let wcy = (((chunk.y % cpa) + cpa) % cpa) as usize;
+                let wcz = (((chunk.z % cpa) + cpa) % cpa) as usize;
+
+                let start_x = wcx * cs;
+                let start_y = wcy * cs;
+                let start_z = wcz * cs;
+
+                let pack_offset = i * chunk_vol;
+
+                for z in 0..cs {
+                    for y in 0..cs {
+                        let dst_idx = (start_z + z) * grid_size * grid_size
+                            + (start_y + y) * grid_size
+                            + start_x;
+                        let src_idx = pack_offset + z * cs * cs + y * cs;
+
+                        voxels_cpu[dst_idx..dst_idx + cs]
+                            .copy_from_slice(&result.packed_data[src_idx..src_idx + cs]);
+                    }
+                }
+            }
+
+            if self.readback_queued {
+                self.request_readback(gpu, false);
+            }
+            return true;
+        }
+
+        if !self.readback_in_flight && self.readback_queued {
+            self.request_readback(gpu, false);
+        }
+        false
+    }
+
+    /// Blocking initialization readback for application start.
+    pub fn initial_blocking_readback(&mut self, gpu: &GpuContext, voxels_cpu: &mut [u32]) {
+        let staging_buf = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ara Initial Readback Staging"),
+            size: VOXEL_BUF_SIZE,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let buf = self.voxel_buf();
+        let mut encoder = gpu
+            .device()
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Ara Initial Readback Encoder"),
+            });
+        encoder.copy_buffer_to_buffer(buf, 0, &staging_buf, 0, VOXEL_BUF_SIZE);
+        gpu.queue().submit(std::iter::once(encoder.finish()));
+
+        let slice = staging_buf.slice(..);
+        let (tx, rx) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+
+        gpu.device().poll(wgpu::Maintain::Wait);
+
+        rx.recv()
+            .expect("Map async channel closed")
+            .expect("Map async failed");
+
+        {
+            let data = staging_buf.slice(..).get_mapped_range();
+            let gpu_voxels: &[u32] = bytemuck::cast_slice(&data);
+            voxels_cpu.copy_from_slice(gpu_voxels);
+        }
+
+        staging_buf.unmap();
+        // staging_buf dropped here, freeing 512MB
+    }
+}
+
+impl Drop for WorldManager {
+    fn drop(&mut self) {
+        // Drop the sender to signal the worker thread to exit
+        // (done implicitly when self is dropped, but we take the handle first)
+        drop(std::mem::replace(
+            &mut self.worker_task_tx,
+            mpsc::channel().0,
+        ));
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn readback_worker(
+    device: Arc<wgpu::Device>,
+    task_rx: mpsc::Receiver<ReadbackTask>,
+    result_tx: mpsc::Sender<ReadbackResult>,
+) {
+    while let Ok(task) = task_rx.recv() {
+        // Poll device until map_async completes
+        loop {
+            device.poll(wgpu::Maintain::Poll);
+            match task.map_rx.try_recv() {
+                Ok(Ok(())) => break,
+                Ok(Err(e)) => {
+                    log::error!("Readback map_async failed: {e}");
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+
+        let slice = task.staging_buf.slice(..task.data_len as u64);
+        let data = slice.get_mapped_range();
+        let packed_data: Vec<u32> = bytemuck::cast_slice(&data).to_vec();
+        drop(data);
+        task.staging_buf.unmap();
+
+        let _ = result_tx.send(ReadbackResult {
+            packed_data,
+            chunks: task.chunks,
+        });
     }
 }
 

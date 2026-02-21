@@ -17,7 +17,7 @@ struct ChunkParams {
 var<push_constant> params: ChunkParams;
 
 @group(0) @binding(0) var<storage, read_write> voxels: array<u32>;
-@group(0) @binding(1) var<storage, read_write> occupancy: array<atomic<u32>>;
+@group(0) @binding(1) var<storage, read_write> occupancy: array<u32>;
 
 // Toroidal wrap for voxel coordinates
 fn wrap(c: i32) -> i32 {
@@ -134,7 +134,7 @@ fn generate(@builtin(global_invocation_id) gid: vec3<u32>) {
         let cy = i32(floor(f32(world_pos.y) / f32(cs)));
         let cz = i32(floor(f32(world_pos.z) / f32(cs)));
         let ci = chunk_index(cx, cy, cz);
-        atomicMax(&occupancy[ci], 1u);
+        occupancy[ci] = 1u;
     }
     
     voxels[idx] = packed_voxel;

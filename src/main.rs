@@ -2,6 +2,7 @@
 
 mod assets;
 mod camera;
+mod font;
 mod gpu;
 mod light;
 mod postprocess;
@@ -16,18 +17,23 @@ use std::time::Instant;
 use log::{debug, error, info};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
-use winit::event::{DeviceEvent, DeviceId, ElementState, KeyEvent, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowId};
 
-use ara_core::glam;
+use ara_core::glam::{self, IVec3};
 use ara_core::{
-    Action, BlockRegistry, GlobalUniforms, InputManager, LightBuffer, PointLight,
+    Action, BlockRegistry, GRID_SIZE, GlobalUniforms, InputManager, LightBuffer, PackedVoxel,
+    PointLight, RayHit, dda_raycast,
 };
 use camera::{FpsCamera, HaltonJitter};
+use font::BitmapFont;
 use gpu::GpuContext;
 use renderer::{AaMode, Renderer};
+use ui::{BlockPickerState, HotbarState, UiContext};
 use world::WorldManager;
 
 const WINDOW_TITLE: &str = "Turi";
@@ -47,6 +53,22 @@ fn default_input_bindings() -> InputManager {
     input
 }
 
+fn aa_mode_name(mode: AaMode) -> &'static str {
+    match mode {
+        AaMode::None => "None",
+        AaMode::Fxaa => "FXAA",
+        AaMode::Smaa => "SMAA",
+        AaMode::Taa => "TAA",
+        AaMode::TaaThenSmaa => "TAA+SMAA",
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractionMode {
+    Block,
+    Sphere,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
@@ -58,11 +80,34 @@ struct App {
     settings: settings::RenderSettings,
     last_frame_time: Option<Instant>,
     start_time: Instant,
-    frame_count: u32,
-    fps_update_time: Instant,
     jitter: HaltonJitter,
     debug_chunk_grid: bool,
     shadow_quality_high: bool,
+
+    // FPS tracking
+    fps_frame_count: u32,
+    fps_update_time: Instant,
+    display_fps: f32,
+    display_frame_time: f32,
+
+    // Debug HUD
+    debug_hud_visible: bool,
+
+    // Block interaction
+    voxels_cpu: Vec<u32>,
+    targeted_block: Option<RayHit>,
+    left_click_pending: bool,
+    right_click_pending: bool,
+    interaction_mode: InteractionMode,
+    brush_dist: f32,
+
+    // Hotbar & picker
+    hotbar: HotbarState,
+    picker: BlockPickerState,
+    mouse_pos: (f32, f32),
+
+    // Brush
+    brush_size: u32,
 }
 
 impl App {
@@ -87,11 +132,29 @@ impl App {
             settings,
             last_frame_time: None,
             start_time: Instant::now(),
-            frame_count: 0,
-            fps_update_time: Instant::now(),
             jitter: HaltonJitter::new(8),
             debug_chunk_grid: false,
             shadow_quality_high: true,
+
+            fps_frame_count: 0,
+            fps_update_time: Instant::now(),
+            display_fps: 0.0,
+            display_frame_time: 0.0,
+
+            debug_hud_visible: false,
+
+            voxels_cpu: Vec::new(),
+            targeted_block: None,
+            left_click_pending: false,
+            right_click_pending: false,
+            interaction_mode: InteractionMode::Block,
+            brush_dist: 10.0,
+
+            hotbar: HotbarState::new(),
+            picker: BlockPickerState::new(),
+            mouse_pos: (0.0, 0.0),
+
+            brush_size: 1,
         }
     }
 
@@ -118,6 +181,86 @@ impl App {
             window.set_cursor_visible(true);
         }
         debug!("Cursor released");
+    }
+
+    fn open_picker(&mut self) {
+        self.picker.visible = true;
+        self.release_cursor();
+    }
+
+    fn close_picker(&mut self) {
+        self.picker.visible = false;
+        self.grab_cursor();
+    }
+
+    /// Per-frame CPU raycast for block targeting.
+    fn update_targeted_block(&mut self) {
+        if self.voxels_cpu.is_empty() {
+            self.targeted_block = None;
+            return;
+        }
+
+        // Pass world position directly. dda_raycast handles toroidal wrapping internally.
+        let voxels: &[PackedVoxel] = bytemuck::cast_slice(&self.voxels_cpu);
+        self.targeted_block =
+            dda_raycast(voxels, self.camera.position, self.camera.forward(), 100.0);
+    }
+
+    /// Apply a block modification (place or destroy) with the current brush size.
+    fn apply_brush(&mut self, center: IVec3, packed: u32) {
+        if let (Some(gpu), Some(world)) = (&self.gpu, &mut self.world) {
+            let is_sphere = matches!(self.interaction_mode, InteractionMode::Sphere);
+            let radius = if is_sphere {
+                self.brush_size as f32
+            } else {
+                0.0
+            };
+
+            world.dispatch_brush(gpu, center, radius, packed, is_sphere);
+            world.request_readback(gpu, false);
+        }
+    }
+
+    fn handle_block_interaction(&mut self) {
+        if self.picker.visible {
+            return;
+        }
+
+        if self.left_click_pending {
+            self.left_click_pending = false;
+            match self.interaction_mode {
+                InteractionMode::Block => {
+                    if let Some(hit) = &self.targeted_block {
+                        self.apply_brush(hit.grid_pos, 0);
+                    }
+                }
+                InteractionMode::Sphere => {
+                    let target = self.camera.position + self.camera.forward() * self.brush_dist;
+                    let target_pos = target.floor().as_ivec3();
+                    self.apply_brush(target_pos, 0);
+                }
+            }
+        }
+
+        if self.right_click_pending {
+            self.right_click_pending = false;
+            let block_id = self.hotbar.selected_block_id();
+            let packed = PackedVoxel::new(block_id).packed;
+
+            match self.interaction_mode {
+                InteractionMode::Block => {
+                    if let Some(hit) = &self.targeted_block {
+                        let place_pos = hit.grid_pos + hit.normal;
+                        self.apply_brush(place_pos, packed);
+                    }
+                }
+                InteractionMode::Sphere => {
+                    let target = self.camera.position + self.camera.forward() * self.brush_dist;
+                    let target_pos = target.floor().as_ivec3();
+                    self.apply_brush(target_pos, packed);
+                }
+            }
+        }
     }
 }
 
@@ -153,6 +296,16 @@ impl ApplicationHandler for App {
         let mut world = WorldManager::new(&gpu);
         world.generate_initial_chunks(&gpu, self.camera.position);
 
+        // Readback voxels for CPU-side raycast
+        info!("Reading back voxel data from GPU (initially blocking)...");
+        let grid_count = (GRID_SIZE as usize) * (GRID_SIZE as usize) * (GRID_SIZE as usize);
+        self.voxels_cpu = vec![0; grid_count];
+        world.initial_blocking_readback(&gpu, &mut self.voxels_cpu);
+        info!("CPU voxel mirror ready ({} voxels)", self.voxels_cpu.len());
+
+        // Generate font atlas
+        let atlas_data = BitmapFont::generate_atlas();
+
         self.registry = Some(registry);
 
         let size = window.inner_size();
@@ -167,6 +320,9 @@ impl ApplicationHandler for App {
             self.settings.bloom_threshold,
             self.settings.bloom_intensity,
             self.settings.bloom_exposure,
+            &atlas_data,
+            font::ATLAS_W,
+            font::ATLAS_H,
         );
 
         let aspect = size.width as f32 / size.height.max(1) as f32;
@@ -193,6 +349,9 @@ impl ApplicationHandler for App {
                 self.gpu = None;
                 event_loop.exit();
             }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.mouse_pos = (position.x as f32, position.y as f32);
+            }
             WindowEvent::KeyboardInput {
                 event:
                     KeyEvent {
@@ -202,55 +361,116 @@ impl ApplicationHandler for App {
                     },
                 ..
             } => {
-                if key == KeyCode::Escape && state == ElementState::Pressed {
-                    self.release_cursor();
-                    return;
-                }
-
-                // F5: Hot reload assets
-                if key == KeyCode::F5 && state == ElementState::Pressed {
-                    if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
-                        match assets::load_blocks() {
-                            Ok(registry) => {
-                                let palette = registry.generate_texture_data();
-                                renderer.reload_palette(gpu, &palette);
-                                self.registry = Some(registry);
-                                info!("Assets reloaded");
-                            }
-                            Err(e) => error!("Failed to reload assets: {e}"),
+                if state == ElementState::Pressed {
+                    // ESC: close picker or release cursor
+                    if key == KeyCode::Escape {
+                        if self.picker.visible {
+                            self.close_picker();
+                        } else {
+                            self.release_cursor();
                         }
+                        return;
                     }
-                    return;
-                }
 
-                // F2: Cycle Anti-Aliasing Mode
-                if key == KeyCode::F2 && state == ElementState::Pressed {
-                    if let Some(renderer) = &mut self.renderer {
-                        let next = match renderer.aa_mode() {
-                            AaMode::None => AaMode::Fxaa,
-                            AaMode::Fxaa => AaMode::Smaa,
-                            AaMode::Smaa => AaMode::Taa,
-                            AaMode::Taa => AaMode::TaaThenSmaa,
-                            AaMode::TaaThenSmaa => AaMode::None,
+                    // F1: Toggle debug HUD
+                    if key == KeyCode::F1 {
+                        self.debug_hud_visible = !self.debug_hud_visible;
+                        return;
+                    }
+
+                    // F2: Cycle Anti-Aliasing Mode
+                    if key == KeyCode::F2 {
+                        if let Some(renderer) = &mut self.renderer {
+                            let next = match renderer.aa_mode() {
+                                AaMode::None => AaMode::Fxaa,
+                                AaMode::Fxaa => AaMode::Smaa,
+                                AaMode::Smaa => AaMode::Taa,
+                                AaMode::Taa => AaMode::TaaThenSmaa,
+                                AaMode::TaaThenSmaa => AaMode::None,
+                            };
+                            renderer.set_aa_mode(next);
+                            info!("Anti-Aliasing Mode: {:?}", renderer.aa_mode());
+                        }
+                        return;
+                    }
+
+                    // F3: Toggle chunk debug grid
+                    if key == KeyCode::F3 {
+                        self.debug_chunk_grid = !self.debug_chunk_grid;
+                        info!(
+                            "Chunk debug grid: {}",
+                            if self.debug_chunk_grid { "ON" } else { "OFF" }
+                        );
+                        return;
+                    }
+
+                    // F4: Toggle Shadow Quality
+                    if key == KeyCode::F4 {
+                        self.shadow_quality_high = !self.shadow_quality_high;
+                        info!(
+                            "Shadow Quality: {}",
+                            if self.shadow_quality_high {
+                                "HIGH"
+                            } else {
+                                "LOW"
+                            }
+                        );
+                        return;
+                    }
+
+                    // F5: Hot reload assets
+                    if key == KeyCode::F5 {
+                        if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
+                            match assets::load_blocks() {
+                                Ok(registry) => {
+                                    let palette = registry.generate_texture_data();
+                                    renderer.reload_palette(gpu, &palette);
+                                    self.registry = Some(registry);
+                                    info!("Assets reloaded");
+                                }
+                                Err(e) => error!("Failed to reload assets: {e}"),
+                            }
+                        }
+                        return;
+                    }
+
+                    // G: Toggle Interaction Mode
+                    if key == KeyCode::KeyG {
+                        self.interaction_mode = match self.interaction_mode {
+                            InteractionMode::Block => InteractionMode::Sphere,
+                            InteractionMode::Sphere => InteractionMode::Block,
                         };
-                        renderer.set_aa_mode(next);
-                        info!("Anti-Aliasing Mode: {:?}", renderer.aa_mode());
+                        info!("Interaction Mode: {:?}", self.interaction_mode);
+                        return;
                     }
-                    return;
-                }
 
-                // F3: Toggle chunk debug grid
-                if key == KeyCode::F3 && state == ElementState::Pressed {
-                    self.debug_chunk_grid = !self.debug_chunk_grid;
-                    info!("Chunk debug grid: {}", if self.debug_chunk_grid { "ON" } else { "OFF" });
-                    return;
-                }
+                    // E: Toggle block picker
+                    if key == KeyCode::KeyE {
+                        if self.picker.visible {
+                            self.close_picker();
+                        } else {
+                            self.open_picker();
+                        }
+                        return;
+                    }
 
-                // F4: Toggle Shadow Quality
-                if key == KeyCode::F4 && state == ElementState::Pressed {
-                    self.shadow_quality_high = !self.shadow_quality_high;
-                    info!("Shadow Quality: {}", if self.shadow_quality_high { "HIGH" } else { "LOW" });
-                    return;
+                    // 1-9: Hotbar slot selection
+                    let slot = match key {
+                        KeyCode::Digit1 => Some(0),
+                        KeyCode::Digit2 => Some(1),
+                        KeyCode::Digit3 => Some(2),
+                        KeyCode::Digit4 => Some(3),
+                        KeyCode::Digit5 => Some(4),
+                        KeyCode::Digit6 => Some(5),
+                        KeyCode::Digit7 => Some(6),
+                        KeyCode::Digit8 => Some(7),
+                        KeyCode::Digit9 => Some(8),
+                        _ => None,
+                    };
+                    if let Some(s) = slot {
+                        self.hotbar.selected = s;
+                        return;
+                    }
                 }
 
                 match state {
@@ -259,11 +479,57 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput {
+                button,
                 state: ElementState::Pressed,
                 ..
             } => {
-                if !self.input.cursor_grabbed {
+                if self.picker.visible {
+                    // Click in picker
+                    if button == MouseButton::Left {
+                        if let Some(registry) = &self.registry {
+                            if let Some(renderer) = &self.renderer {
+                                if let Some(window) = &self.window {
+                                    let size = window.inner_size();
+                                    if let Some(block_id) = renderer.picker_hit_test(
+                                        self.mouse_pos.0,
+                                        self.mouse_pos.1,
+                                        size.width as f32,
+                                        size.height as f32,
+                                        registry.block_count() as usize,
+                                    ) {
+                                        self.hotbar.slots[self.hotbar.selected] = block_id;
+                                        self.close_picker();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else if !self.input.cursor_grabbed {
                     self.grab_cursor();
+                } else {
+                    match button {
+                        MouseButton::Left => self.left_click_pending = true,
+                        MouseButton::Right => self.right_click_pending = true,
+                        _ => {}
+                    }
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if self.input.cursor_grabbed && !self.picker.visible {
+                    let scroll = match delta {
+                        MouseScrollDelta::LineDelta(_, y) => y,
+                        MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
+                    };
+
+                    if self.input.is_active(Action::Sprint) {
+                        self.brush_dist = (self.brush_dist + scroll).clamp(2.0, 100.0);
+                    } else {
+                        if scroll > 0.0 {
+                            self.brush_size = (self.brush_size + 1).min(10);
+                        } else if scroll < 0.0 {
+                            self.brush_size = self.brush_size.saturating_sub(1).max(1);
+                        }
+                    }
                 }
             }
             WindowEvent::Focused(false) => {
@@ -289,19 +555,34 @@ impl ApplicationHandler for App {
 
                 self.camera.update(&mut self.input, dt);
 
-                if let (Some(gpu), Some(renderer), Some(world), Some(window)) =
-                    (&self.gpu, &mut self.renderer, &mut self.world, &self.window)
-                {
+                // CPU raycast for block targeting
+                self.update_targeted_block();
+
+                // Process pending clicks
+                self.handle_block_interaction();
+
+                if let (Some(gpu), Some(renderer), Some(world), Some(window), Some(registry)) = (
+                    &self.gpu,
+                    &mut self.renderer,
+                    &mut self.world,
+                    &self.window,
+                    &self.registry,
+                ) {
                     // Stream new chunks as player moves
-                    world.update_view(gpu, self.camera.position);
+                    if world.update_view(gpu, self.camera.position) {
+                        world.request_readback(gpu, false);
+                    }
+
+                    // Poll for completed async chunk readback
+                    world.poll_readback(gpu, &mut self.voxels_cpu);
 
                     // Physics Pass
                     {
-                        let mut encoder = gpu
-                            .device()
-                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                                label: Some("Ara Physics Dispatch"),
-                            });
+                        let mut encoder =
+                            gpu.device()
+                                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                    label: Some("Ara Physics Dispatch"),
+                                });
                         world.dispatch_physics(&mut encoder);
                         gpu.queue().submit(std::iter::once(encoder.finish()));
                     }
@@ -333,6 +614,27 @@ impl ApplicationHandler for App {
                         .to_cols_array_2d();
 
                     let s = &self.settings;
+                    let selected_block = self
+                        .targeted_block
+                        .as_ref()
+                        .map(|h| [h.grid_pos.x, h.grid_pos.y, h.grid_pos.z]);
+
+                    let brush_pos_radius =
+                        if matches!(self.interaction_mode, InteractionMode::Sphere) {
+                            let target =
+                                self.camera.position + self.camera.forward() * self.brush_dist;
+                            // Snap to grid center for consistency with voxel grid
+                            let snapped = target.floor() + 0.5;
+                            ara_core::glam::Vec4::new(
+                                snapped.x,
+                                snapped.y,
+                                snapped.z,
+                                self.brush_size as f32,
+                            )
+                        } else {
+                            ara_core::glam::Vec4::ZERO
+                        };
+
                     let mut uniforms = GlobalUniforms::with_view_proj(
                         self.camera.view_inverse().to_cols_array_2d(),
                         proj_inverse_jittered,
@@ -346,10 +648,11 @@ impl ApplicationHandler for App {
                         s.sky_intensity,
                         s.ground_color,
                         s.light_max_distance,
-                        None,
+                        selected_block,
                         world.world_origin(),
                         prev_view_proj_unjittered,
                         curr_view_proj_unjittered,
+                        brush_pos_radius,
                     );
                     uniforms.ground_color.w = if self.shadow_quality_high { 1.0 } else { 0.0 };
 
@@ -368,16 +671,27 @@ impl ApplicationHandler for App {
                     };
                     lights.count += 1;
 
-                    match renderer.render(
-                        gpu,
-                        &uniforms,
-                        &lights,
-                        &crate::ui::UiContext {
-                            screen_width: size.width as f32,
-                            screen_height: size.height as f32,
-                            selected_block_name: String::new(),
+                    let wo = world.world_origin_ivec3();
+                    let ui_ctx = UiContext {
+                        screen_width: width,
+                        screen_height: height,
+                        debug_visible: self.debug_hud_visible,
+                        fps: self.display_fps,
+                        frame_time_ms: self.display_frame_time,
+                        camera_pos: self.camera.position.into(),
+                        world_origin: [wo.x, wo.y, wo.z],
+                        aa_mode_name: aa_mode_name(renderer.aa_mode()),
+                        hotbar: &self.hotbar,
+                        registry,
+                        picker_visible: self.picker.visible,
+                        brush_size: self.brush_size,
+                        interaction_mode: match self.interaction_mode {
+                            InteractionMode::Block => "Block",
+                            InteractionMode::Sphere => "Sphere",
                         },
-                    ) {
+                    };
+
+                    match renderer.render(gpu, &uniforms, &lights, &ui_ctx) {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             let size = window.inner_size();
@@ -396,17 +710,18 @@ impl ApplicationHandler for App {
                 }
 
                 // FPS counter
-                self.frame_count += 1;
+                self.fps_frame_count += 1;
                 let elapsed = self.fps_update_time.elapsed().as_secs_f32();
-                if elapsed >= 1.0 {
-                    let fps = self.frame_count as f32 / elapsed;
-                    let frame_ms = elapsed * 1000.0 / self.frame_count as f32;
+                if elapsed >= 0.5 {
+                    self.display_fps = self.fps_frame_count as f32 / elapsed;
+                    self.display_frame_time = elapsed * 1000.0 / self.fps_frame_count as f32;
                     if let Some(window) = &self.window {
                         window.set_title(&format!(
-                            "{WINDOW_TITLE} | {fps:.0} FPS ({frame_ms:.1} ms)"
+                            "{WINDOW_TITLE} | {:.0} FPS ({:.1} ms)",
+                            self.display_fps, self.display_frame_time
                         ));
                     }
-                    self.frame_count = 0;
+                    self.fps_frame_count = 0;
                     self.fps_update_time = Instant::now();
                 }
             }

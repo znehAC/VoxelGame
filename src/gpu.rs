@@ -1,6 +1,6 @@
 //! Headless-first GPU context wrapping wgpu Instance/Adapter/Device/Queue.
 
-
+use std::sync::Arc;
 
 /// Core GPU state that can operate headless (compute-only) or with a surface.
 pub struct GpuContext {
@@ -8,8 +8,8 @@ pub struct GpuContext {
     #[allow(dead_code)]
     instance: wgpu::Instance,
     adapter: wgpu::Adapter,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
+    device: Arc<wgpu::Device>,
+    queue: Arc<wgpu::Queue>,
 }
 
 impl GpuContext {
@@ -20,8 +20,6 @@ impl GpuContext {
             ..Default::default()
         })
     }
-
-
 
     /// Create a context from an existing instance, optionally compatible with a surface.
     pub async fn from_instance(
@@ -59,12 +57,10 @@ impl GpuContext {
         Self {
             instance,
             adapter,
-            device,
-            queue,
+            device: Arc::new(device),
+            queue: Arc::new(queue),
         }
     }
-
-
 
     pub fn adapter(&self) -> &wgpu::Adapter {
         &self.adapter
@@ -78,5 +74,7 @@ impl GpuContext {
         &self.queue
     }
 
-
+    pub fn device_arc(&self) -> Arc<wgpu::Device> {
+        Arc::clone(&self.device)
+    }
 }

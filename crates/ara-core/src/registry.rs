@@ -94,6 +94,25 @@ impl BlockRegistry {
         self.blocks.get(index as usize).map(|b| b.name.as_str())
     }
 
+    /// Get a block definition by its sequential index.
+    pub fn get_block(&self, idx: u16) -> Option<&BlockDef> {
+        self.blocks.get(idx as usize)
+    }
+
+    /// Get the sRGB color of a block as [f32; 4] (0.0-1.0).
+    pub fn get_block_color_f32(&self, idx: u16) -> [f32; 4] {
+        if idx == 0 {
+            return [0.0, 0.0, 0.0, 0.0];
+        }
+        match self.blocks.get(idx as usize) {
+            Some(block) => {
+                let [r, g, b] = parse_hex_color(&block.color);
+                [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0]
+            }
+            None => [1.0, 0.0, 1.0, 1.0],
+        }
+    }
+
     /// Total number of registered blocks (including Air).
     pub fn block_count(&self) -> u16 {
         self.blocks.len() as u16
