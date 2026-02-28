@@ -16,6 +16,7 @@ pub struct RenderSettings {
     pub camera_fov: f32,
     pub camera_start_position: [f32; 3],
     pub camera_start_pitch: f32,
+    pub vsync: bool,
 }
 
 impl Default for RenderSettings {
@@ -37,6 +38,7 @@ impl Default for RenderSettings {
             camera_fov: std::f32::consts::FRAC_PI_4,
             camera_start_position: [32.0, 62.0, 10.0],
             camera_start_pitch: -0.3,
+            vsync: false,
         }
     }
 }

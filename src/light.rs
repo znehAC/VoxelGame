@@ -1,60 +1,46 @@
-//! GPU-based RGB light propagation via cellular automata on 3D textures.
+//! VCT pipeline — sun injection + LOD mipmap compute passes for voxel cone tracing GI.
 
 use crate::gpu::GpuContext;
-use ara_core::GRID_SIZE;
+use ara_core::bytemuck;
 
-/// Ping-pong light propagation system using two 64^3 RGBA8 volumes.
-pub struct LightPropagation {
-    compute_pipeline: wgpu::ComputePipeline,
-    /// A→B: read from volume_a, write to volume_b
-    compute_bind_group_ab: wgpu::BindGroup,
-    /// B→A: read from volume_b, write to volume_a
-    compute_bind_group_ba: wgpu::BindGroup,
-    /// Raytracer samples volume_a
-    read_bind_group_a: wgpu::BindGroup,
-    /// Raytracer samples volume_b
-    read_bind_group_b: wgpu::BindGroup,
-    read_bind_group_layout: wgpu::BindGroupLayout,
-    /// true = current result is in volume_a
-    current_is_a: bool,
-    iterations: u32,
+/// Voxel Cone Tracing pipeline: sun injection + LOD mipmap compute passes.
+pub struct VctPipeline {
+    inject_pipeline: wgpu::ComputePipeline,
+    inject_bind_group: wgpu::BindGroup,
+    mipmap_pipeline: wgpu::ComputePipeline,
+    mipmap_bind_group: wgpu::BindGroup,
 }
 
-impl LightPropagation {
+impl VctPipeline {
     pub fn new(
         gpu: &GpuContext,
-        voxel_buf: &wgpu::Buffer,
+        top_grid_buf: &wgpu::Buffer,
+        brick_pool_buf: &wgpu::Buffer,
+        brick_header_buf: &wgpu::Buffer,
+        radiance_pool_buf: &wgpu::Buffer,
+        brick_occupancy_buf: &wgpu::Buffer,
         uniform_buf: &wgpu::Buffer,
         palette_tex: &wgpu::Texture,
-        iterations: u32,
     ) -> Self {
         let device = gpu.device();
 
-        let volume_a = create_light_volume(device, "Ara Light Volume A");
-        let volume_b = create_light_volume(device, "Ara Light Volume B");
-
-        let view_a = volume_a.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("Ara Light View A"),
-            dimension: Some(wgpu::TextureViewDimension::D3),
-            ..Default::default()
-        });
-        let view_b = volume_b.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("Ara Light View B"),
-            dimension: Some(wgpu::TextureViewDimension::D3),
-            ..Default::default()
-        });
-
         let palette_view = palette_tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("Ara Palette View (Light)"),
+            label: Some("VCT Palette View"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
 
-        // Compute bind group layout
-        let compute_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Ara Light Compute BGL"),
+        // Sun injection BGL:
+        // 0: top_grid (storage read)
+        // 1: brick_pool (storage read)
+        // 2: brick_headers (storage read)
+        // 3: radiance_pool (storage read_write)
+        // 4: uniforms
+        // 5: palette texture
+        // 6: brick_occupancy (storage read)
+        let inject_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("VCT Sun Inject BGL"),
             entries: &[
-                // 0: voxel SSBO
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -65,40 +51,36 @@ impl LightPropagation {
                     },
                     count: None,
                 },
-                // 1: light source (read)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
-                // 2: light destination (write)
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D3,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
-                // 3: palette texture
                 wgpu::BindGroupLayoutEntry {
                     binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
-                // 4: Global Uniforms
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
                     visibility: wgpu::ShaderStages::COMPUTE,
@@ -109,222 +91,220 @@ impl LightPropagation {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
-        // A→B bind group
-        let compute_bind_group_ab = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Ara Light Compute A→B"),
-            layout: &compute_bgl,
+        let inject_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("VCT Sun Inject Bind Group"),
+            layout: &inject_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: voxel_buf.as_entire_binding(),
+                    resource: top_grid_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view_a),
+                    resource: brick_pool_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&view_b),
+                    resource: brick_header_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&palette_view),
+                    resource: radiance_pool_buf.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: uniform_buf.as_entire_binding(),
                 },
-            ],
-        });
-
-        // B→A bind group
-        let compute_bind_group_ba = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Ara Light Compute B→A"),
-            layout: &compute_bgl,
-            entries: &[
                 wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: voxel_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view_b),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&view_a),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
+                    binding: 5,
                     resource: wgpu::BindingResource::TextureView(&palette_view),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: uniform_buf.as_entire_binding(),
+                    binding: 6,
+                    resource: brick_occupancy_buf.as_entire_binding(),
                 },
             ],
         });
 
-        // Raytracer read bind group layout
-        let read_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Ara Light Read BGL"),
-                entries: &[
-                    // 0: light volume (sample)
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D3,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    // 1: sampler
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
-
-        let light_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Ara Light Sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
+        let inject_shader_src = include_str!("../assets/shaders/sun_inject.wgsl");
+        let inject_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("VCT Sun Inject Shader"),
+            source: wgpu::ShaderSource::Wgsl(inject_shader_src.into()),
         });
 
-        let read_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Ara Light Read A"),
-            layout: &read_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view_a),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&light_sampler),
-                },
-            ],
-        });
-
-        let read_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Ara Light Read B"),
-            layout: &read_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view_b),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&light_sampler),
-                },
-            ],
-        });
-
-        // Compute pipeline
-        let shader_src = include_str!("../assets/shaders/light_propagate.wgsl");
-        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Ara Light Propagation Shader"),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
-
-        let compute_pipeline_layout =
+        let inject_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Ara Light Compute Pipeline Layout"),
-                bind_group_layouts: &[&compute_bgl],
+                label: Some("VCT Sun Inject Pipeline Layout"),
+                bind_group_layouts: &[&inject_bgl],
                 push_constant_ranges: &[],
             });
 
-        let compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Ara Light Compute Pipeline"),
-            layout: Some(&compute_pipeline_layout),
-            module: &shader,
-            entry_point: Some("propagate"),
+        let inject_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("VCT Sun Inject Pipeline"),
+            layout: Some(&inject_pipeline_layout),
+            module: &inject_shader,
+            entry_point: Some("inject"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        // LOD mipmap BGL (same buffers, read_write on brick_pool + radiance_pool)
+        let mipmap_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("VCT LOD Mipmap BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let mipmap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("VCT LOD Mipmap Bind Group"),
+            layout: &mipmap_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: top_grid_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: brick_pool_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: brick_header_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: radiance_pool_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let mipmap_shader_src = include_str!("../assets/shaders/lod_mipmap.wgsl");
+        let mipmap_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("VCT LOD Mipmap Shader"),
+            source: wgpu::ShaderSource::Wgsl(mipmap_shader_src.into()),
+        });
+
+        let mipmap_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("VCT LOD Mipmap Pipeline Layout"),
+                bind_group_layouts: &[&mipmap_bgl],
+                push_constant_ranges: &[wgpu::PushConstantRange {
+                    stages: wgpu::ShaderStages::COMPUTE,
+                    range: 0..4,
+                }],
+            });
+
+        let mipmap_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("VCT LOD Mipmap Pipeline"),
+            layout: Some(&mipmap_pipeline_layout),
+            module: &mipmap_shader,
+            entry_point: Some("mipmap"),
             compilation_options: Default::default(),
             cache: None,
         });
 
         Self {
-            compute_pipeline,
-            compute_bind_group_ab,
-            compute_bind_group_ba,
-            read_bind_group_a,
-            read_bind_group_b,
-            read_bind_group_layout,
-            current_is_a: true,
-            iterations,
+            inject_pipeline,
+            inject_bind_group,
+            mipmap_pipeline,
+            mipmap_bind_group,
         }
     }
 
-    /// Run N iterations of light propagation with ping-pong swapping.
-    pub fn propagate(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        let workgroups = GRID_SIZE / 4;
+    /// Run sun injection then LOD mipmap (LOD0→1, LOD1→2).
+    pub fn inject(&self, encoder: &mut wgpu::CommandEncoder, max_bricks: u32) {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("VCT Sun Inject Pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&self.inject_pipeline);
+        pass.set_bind_group(0, &self.inject_bind_group, &[]);
+        pass.dispatch_workgroups(max_bricks, 2, 1);
+    }
 
-        for _ in 0..self.iterations {
-            let bind_group = if self.current_is_a {
-                &self.compute_bind_group_ab
-            } else {
-                &self.compute_bind_group_ba
-            };
-
-            {
-                let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Ara Light Propagation Pass"),
-                    timestamp_writes: None,
-                });
-                pass.set_pipeline(&self.compute_pipeline);
-                pass.set_bind_group(0, bind_group, &[]);
-                pass.dispatch_workgroups(workgroups, workgroups, workgroups);
-            }
-
-            self.current_is_a = !self.current_is_a;
+    pub fn mipmap(&self, encoder: &mut wgpu::CommandEncoder, max_bricks: u32) {
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("VCT LOD Mipmap LOD1"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.mipmap_pipeline);
+            pass.set_bind_group(0, &self.mipmap_bind_group, &[]);
+            pass.set_push_constants(0, bytemuck::bytes_of(&1u32));
+            pass.dispatch_workgroups(max_bricks, 2, 1);
+        }
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("VCT LOD Mipmap LOD2"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.mipmap_pipeline);
+            pass.set_bind_group(0, &self.mipmap_bind_group, &[]);
+            pass.set_push_constants(0, bytemuck::bytes_of(&2u32));
+            pass.dispatch_workgroups(max_bricks, 2, 1);
         }
     }
-
-    /// Bind group layout for the raytracer to reference in its pipeline layout.
-    pub fn read_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
-        &self.read_bind_group_layout
-    }
-
-    /// Current result bind group for the raytracer to sample.
-    pub fn current_read_bind_group(&self) -> &wgpu::BindGroup {
-        if self.current_is_a {
-            &self.read_bind_group_a
-        } else {
-            &self.read_bind_group_b
-        }
-    }
-}
-
-fn create_light_volume(device: &wgpu::Device, label: &str) -> wgpu::Texture {
-    device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width: GRID_SIZE,
-            height: GRID_SIZE,
-            depth_or_array_layers: GRID_SIZE,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D3,
-        format: wgpu::TextureFormat::Rgba16Float,
-        usage: wgpu::TextureUsages::STORAGE_BINDING
-            | wgpu::TextureUsages::TEXTURE_BINDING
-            | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    })
 }

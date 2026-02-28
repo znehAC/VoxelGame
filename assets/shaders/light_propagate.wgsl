@@ -1,10 +1,13 @@
-const GRID_SIZE: u32 = 64u;
-const GS: i32 = 64;
+const LIGHT_GRID_SIZE: u32 = 512u;
+const LIGHT_GRID_MASK: i32 = 511;
+const FALLOFF: f32 = 0.85;
 
-// Multiplicative attenuation factors
-// Use float math directly. no more integer approximations.
-// Multiplicative attenuation factors
-// Use float math directly. no more integer approximations.
+const BRICK_SHIFT: u32 = 3u;
+const BRICK_VOLUME: u32 = 512u;
+const TOP_GRID_SIZE: u32 = 64u;
+const WORLD_EXTENT: u32 = 512u;
+const BRICK_EMPTY: u32 = 0xFFFFFFFFu;
+
 struct GlobalUniforms {
     view_inverse: mat4x4f,
     proj_inverse: mat4x4f,
@@ -18,210 +21,286 @@ struct GlobalUniforms {
     sky_color: vec4f,
     ground_color: vec4f,
     selected_block: vec4f,
+    prev_view_proj: mat4x4f,
+    curr_view_proj: mat4x4f,
+    world_origin: vec4f,
 }
 
-const FACTOR_FACE: f32 = 0.80; // Stricter decay for indirect light (Cave darkness)
-const FACTOR_EDGE: f32 = 0.81;    // 0.9 * 0.9
-const FACTOR_CORNER: f32 = 0.729; // 0.9 * 0.9 * 0.9
-const BOUNCE_INTENSITY: f32 = 0.2; // How much sun light bounces off walls
+const FACTOR_FACE: f32 = 0.80;
+const FACTOR_EDGE: f32 = 0.81;
+const FACTOR_CORNER: f32 = 0.729;
+const BOUNCE_INTENSITY: f32 = 0.2;
+const MAX_SHADOW_STEPS: u32 = 48u;
 
-@group(0) @binding(0) var<storage, read> voxels: array<u32>;
-@group(0) @binding(1) var light_src: texture_3d<f32>;
-@group(0) @binding(2) var light_dst: texture_storage_3d<rgba16float, write>;
-@group(0) @binding(3) var t_palette: texture_2d_array<f32>;
-@group(0) @binding(4) var<uniform> globals: GlobalUniforms;
-
-fn voxel_index(pos: vec3<u32>) -> u32 {
-    return pos.z * GRID_SIZE * GRID_SIZE + pos.y * GRID_SIZE + pos.x;
+struct PointLight {
+    position: vec4f,
+    color: vec4f,
+    flags: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
 }
 
-fn voxel_idx_i(pos: vec3i) -> u32 {
-    return u32(pos.z) * GRID_SIZE * GRID_SIZE + u32(pos.y) * GRID_SIZE + u32(pos.x);
+struct LightBuffer {
+    count: u32,
+    pad0: u32,
+    pad1: u32,
+    pad2: u32,
+    lights: array<PointLight, 16>,
 }
 
-fn in_bounds(p: vec3i) -> bool {
-    return p.x >= 0 && p.x < GS && p.y >= 0 && p.y < GS && p.z >= 0 && p.z < GS;
+@group(0) @binding(0) var<storage, read> top_grid: array<u32>;
+@group(0) @binding(1) var<storage, read> brick_pool: array<u32>;
+@group(0) @binding(2) var<storage, read> light_in: array<u32>;
+@group(0) @binding(3) var<storage, read_write> light_out: array<u32>;
+@group(0) @binding(4) var<storage, read> dirty_chunks: array<u32>;
+@group(0) @binding(5) var<uniform> toroidal_origin: vec4i;
+@group(0) @binding(6) var<storage, read> active_chunks: array<u32>;
+@group(0) @binding(7) var t_palette: texture_2d_array<f32>;
+@group(0) @binding(8) var<uniform> globals: GlobalUniforms;
+@group(0) @binding(9) var<uniform> point_lights: LightBuffer;
+
+fn pack_rgb10(c: vec3f) -> u32 {
+    let p = vec3u(clamp(c * 0.1, vec3f(0.0), vec3f(1.0)) * 1023.0);
+    return (p.x << 20u) | (p.y << 10u) | p.z;
 }
 
-fn is_opaque_at(p: vec3i) -> bool {
-    if !in_bounds(p) { return true; }
-    return (voxels[voxel_idx_i(p)] & 0x3FFFu) != 0u;
+fn unpack_rgb10(p: u32) -> vec3f {
+    let r = f32((p >> 20u) & 0x3FFu);
+    let g = f32((p >> 10u) & 0x3FFu);
+    let b = f32(p & 0x3FFu);
+    return vec3f(r, g, b) * 0.000977517 * 10.0; 
 }
 
-fn read_light(p: vec3i) -> vec3f {
-    if !in_bounds(p) { return vec3f(0.0); }
-    return textureLoad(light_src, p, 0).rgb;
+fn toroidal_idx(world_pos: vec3i) -> u32 {
+    let tx = u32(world_pos.x & LIGHT_GRID_MASK);
+    let ty = u32(world_pos.y & LIGHT_GRID_MASK);
+    let tz = u32(world_pos.z & LIGHT_GRID_MASK);
+    return tz * 262144u + ty * 512u + tx; 
+}
+
+fn read_light(world_pos: vec3i) -> vec3f {
+    return unpack_rgb10(light_in[toroidal_idx(world_pos)]);
+}
+
+fn sbm_read_voxel(world_pos: vec3i) -> u32 {
+    if (world_pos.x < 0 || world_pos.y < 0 || world_pos.z < 0 ||
+        world_pos.x >= i32(WORLD_EXTENT) || world_pos.y >= i32(WORLD_EXTENT) || world_pos.z >= i32(WORLD_EXTENT)) {
+        return 0u;
+    }
+    let bx = u32(world_pos.x) >> BRICK_SHIFT;
+    let by = u32(world_pos.y) >> BRICK_SHIFT;
+    let bz = u32(world_pos.z) >> BRICK_SHIFT;
+    
+    let tgs = TOP_GRID_SIZE;
+    let grid_idx = (bz % tgs) * tgs * tgs + (by % tgs) * tgs + (bx % tgs);
+    let brick_idx = top_grid[grid_idx];
+    
+    if (brick_idx == BRICK_EMPTY) { return 0u; }
+    
+    let lx = u32(world_pos.x) & 7u;
+    let ly = u32(world_pos.y) & 7u;
+    let lz = u32(world_pos.z) & 7u;
+    let linear = lz * 64u + ly * 8u + lx;
+    let word = brick_pool[brick_idx * 256u + (linear >> 1u)];
+    return (word >> ((linear & 1u) * 16u)) & 0xFFFFu;
+}
+
+fn is_opaque(pos: vec3i) -> bool {
+    return (sbm_read_voxel(pos) & 0x1FFu) != 0u;
+}
+
+fn trace_visibility(origin: vec3i, dir: vec3f, max_dist: f32) -> bool {
+    let inv_dir = 1.0 / dir;
+    let step = vec3i(sign(dir));
+    let t_delta = abs(inv_dir);
+    
+    var cell = origin;
+    var t_max: vec3f;
+    let o_f = vec3f(origin) + 0.5;
+    
+    if (dir.x > 0.0) { t_max.x = (f32(cell.x + 1) - o_f.x) * inv_dir.x; } else { t_max.x = (o_f.x - f32(cell.x)) * -inv_dir.x; }
+    if (dir.y > 0.0) { t_max.y = (f32(cell.y + 1) - o_f.y) * inv_dir.y; } else { t_max.y = (o_f.y - f32(cell.y)) * -inv_dir.y; }
+    if (dir.z > 0.0) { t_max.z = (f32(cell.z + 1) - o_f.z) * inv_dir.z; } else { t_max.z = (o_f.z - f32(cell.z)) * -inv_dir.z; }
+
+    let max_steps = min(MAX_SHADOW_STEPS, u32(max_dist) + 1u);
+
+    for (var i = 0u; i < max_steps; i++) {
+        if (t_max.x < t_max.y) {
+            if (t_max.x < t_max.z) { cell.x += step.x; t_max.x += t_delta.x; } 
+            else { cell.z += step.z; t_max.z += t_delta.z; }
+        } else {
+            if (t_max.y < t_max.z) { cell.y += step.y; t_max.y += t_delta.y; } 
+            else { cell.z += step.z; t_max.z += t_delta.z; }
+        }
+
+        if (cell.x < 0 || cell.y < 0 || cell.z < 0 || cell.x >= i32(WORLD_EXTENT) || cell.y >= i32(WORLD_EXTENT) || cell.z >= i32(WORLD_EXTENT)) { return true; }
+        if (is_opaque(cell)) { return false; }
+    }
+    return true;
+}
+
+fn check_sun_path_dda(origin: vec3i, dir: vec3f) -> bool {
+    return trace_visibility(origin, dir, 512.0);
+}
+
+fn trace_upwards(origin: vec3i) -> bool {
+    var y = origin.y + 1;
+    let bx = u32(origin.x) >> BRICK_SHIFT;
+    let bz = u32(origin.z) >> BRICK_SHIFT;
+    let tgs = TOP_GRID_SIZE;
+    
+    if (origin.x < 0 || origin.x >= i32(WORLD_EXTENT) || origin.z < 0 || origin.z >= i32(WORLD_EXTENT)) {
+        return true; 
+    }
+
+    while (y < i32(WORLD_EXTENT)) {
+        let by = u32(y) >> BRICK_SHIFT;
+        let grid_idx = (bz % tgs) * tgs * tgs + (by % tgs) * tgs + (bx % tgs);
+        let brick_idx = top_grid[grid_idx];
+        
+        if (brick_idx == BRICK_EMPTY) {
+            y = i32((by + 1u) << BRICK_SHIFT);
+            continue;
+        }
+
+        let max_y_for_brick = i32((by + 1u) << BRICK_SHIFT);
+        let max_y = min(max_y_for_brick, i32(WORLD_EXTENT));
+        
+        let lx = u32(origin.x) & 7u;
+        let lz = u32(origin.z) & 7u;
+        
+        while (y < max_y) {
+            let ly = u32(y) & 7u;
+            let linear = lz * 64u + ly * 8u + lx;
+            let word = brick_pool[brick_idx * 256u + (linear >> 1u)];
+            let voxel = (word >> ((linear & 1u) * 16u)) & 0xFFFFu;
+
+            if ((voxel & 0x1FFu) != 0u) {
+                return false;
+            }
+            y += 1;
+        }
+    }
+    
+    return true;
 }
 
 fn propagate_light(light: vec3f, factor: f32) -> vec3f {
     return light * factor;
 }
 
-fn check_sun_path(start_pos: vec3i, sun_dir: vec3f) -> bool {
-    let step = normalize(sun_dir);
-    // Start slightly outside the voxel center to avoid self-occlusion
-    var p = vec3f(vec3f(start_pos) + vec3f(0.5) + step * 0.7);
+@compute @workgroup_size(8, 8, 4)
+fn propagate(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {
+    let chunk_idx = active_chunks[wg.x];
     
-    // Raymarch towards the sun
-    // 48 steps covers the diagonal of a 64^3 grid
-    for (var i = 0; i < 48; i++) {
-        let ip = vec3i(floor(p));
+    // Decode chunk_idx -> cx, cy, cz
+    let cx = chunk_idx & 63u;
+    let cy = (chunk_idx >> 6u) & 63u;
+    let cz = chunk_idx >> 12u;
+
+    let world_base = vec3i(i32(cx), i32(cy), i32(cz)) * 8 + toroidal_origin.xyz;
+
+    for (var z_half = 0u; z_half < 2u; z_half++) {
+        let lz = lid.z + z_half * 4u;
+        let world_pos = world_base + vec3i(i32(lid.x), i32(lid.y), i32(lz));
+        let idx = toroidal_idx(world_pos);
+
+        let packed_voxel = sbm_read_voxel(world_pos);
+        let material_id = packed_voxel & 0x1FFu;
+
+        if (material_id != 0u) {
+            let pu = material_id % 256u;
+            let pv = material_id / 256u;
+            let coords = vec2i(i32(pu), i32(pv));
+            
+            let albedo = textureLoad(t_palette, coords, 0, 0).rgb;
+            let props = textureLoad(t_palette, coords, 1, 0);
+            let emission = props.g;
+
+            var emit = vec3f(0.0);
+            if (emission > 0.01) {
+                emit = albedo * emission * 5.0; 
+            }
+
+            light_out[idx] = pack_rgb10(emit);
+            continue;
+        }
+
+        var best = vec3f(0.0);
+
+        var sky = vec3f(0.0);
+        if (world_pos.y >= i32(WORLD_EXTENT - 1u)) {
+            let night_base = vec3f(0.02, 0.02, 0.05);
+            sky = globals.sun_color.rgb * 0.5 + night_base;
+        }
+        best = max(best, sky);
+
+        let op_nx = is_opaque(world_pos + vec3i(-1, 0, 0));
+        let op_px = is_opaque(world_pos + vec3i( 1, 0, 0));
+        let op_ny = is_opaque(world_pos + vec3i( 0,-1, 0));
+        let op_py = is_opaque(world_pos + vec3i( 0, 1, 0));
+        let op_nz = is_opaque(world_pos + vec3i( 0, 0,-1));
+        let op_pz = is_opaque(world_pos + vec3i( 0, 0, 1));
         
-        // 1. Reached Sky (Out of bounds) -> Visible
-        if (!in_bounds(ip)) { return true; }
+        var sky_visible = false;
         
-        // 2. Hit Solid Block -> Occluded
-        if (is_opaque_at(ip)) { return false; }
+        if (world_pos.y >= i32(WORLD_EXTENT - 1u)) {
+            sky_visible = true;
+        } else {
+            if (!op_py) {
+                 sky_visible = trace_upwards(world_pos);
+            }
+            
+            if (!sky_visible) {
+                 if (!op_nx && trace_upwards(world_pos + vec3i(-1, 0, 0))) { sky_visible = true; }
+                 else if (!op_px && trace_upwards(world_pos + vec3i( 1, 0, 0))) { sky_visible = true; }
+                 else if (!op_nz && trace_upwards(world_pos + vec3i( 0, 0,-1))) { sky_visible = true; }
+                 else if (!op_pz && trace_upwards(world_pos + vec3i( 0, 0, 1))) { sky_visible = true; }
+            }
+        }
+
+        let sky_boost = globals.sky_color.rgb * globals.sky_color.w * 1.5;
+
+        if (sky_visible) { 
+             best = max(best, sky_boost); 
+        }
+
+        // --- 6 face neighbors ---
+        best = max(best, propagate_light(read_light(world_pos + vec3i(-1, 0, 0)), FACTOR_FACE));
+        best = max(best, propagate_light(read_light(world_pos + vec3i( 1, 0, 0)), FACTOR_FACE));
+        best = max(best, propagate_light(read_light(world_pos + vec3i( 0,-1, 0)), FACTOR_FACE));
+        best = max(best, propagate_light(read_light(world_pos + vec3i( 0, 1, 0)), FACTOR_FACE));
+        best = max(best, propagate_light(read_light(world_pos + vec3i( 0, 0,-1)), FACTOR_FACE));
+        best = max(best, propagate_light(read_light(world_pos + vec3i( 0, 0, 1)), FACTOR_FACE));
+
+        // --- 12 edge neighbors ---
+        if (!op_nx && !op_ny) { best = max(best, propagate_light(read_light(world_pos + vec3i(-1,-1, 0)), FACTOR_EDGE)); }
+        if (!op_px && !op_ny) { best = max(best, propagate_light(read_light(world_pos + vec3i( 1,-1, 0)), FACTOR_EDGE)); }
+        if (!op_nx && !op_py) { best = max(best, propagate_light(read_light(world_pos + vec3i(-1, 1, 0)), FACTOR_EDGE)); }
+        if (!op_px && !op_py) { best = max(best, propagate_light(read_light(world_pos + vec3i( 1, 1, 0)), FACTOR_EDGE)); }
         
-        // 3. Optimization: Hit an already Bright Air Voxel -> Visible
-        // If we hit air that is effectively "Sky", we can assume clear path.
-        let light = read_light(ip);
-        if (light.g > 0.8) { return true; }
+        if (!op_nx && !op_nz) { best = max(best, propagate_light(read_light(world_pos + vec3i(-1, 0,-1)), FACTOR_EDGE)); }
+        if (!op_px && !op_nz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 1, 0,-1)), FACTOR_EDGE)); }
+        if (!op_nx && !op_pz) { best = max(best, propagate_light(read_light(world_pos + vec3i(-1, 0, 1)), FACTOR_EDGE)); }
+        if (!op_px && !op_pz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 1, 0, 1)), FACTOR_EDGE)); }
         
-        p += step;
+        if (!op_ny && !op_nz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 0,-1,-1)), FACTOR_EDGE)); }
+        if (!op_py && !op_nz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 0, 1,-1)), FACTOR_EDGE)); }
+        if (!op_ny && !op_pz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 0,-1, 1)), FACTOR_EDGE)); }
+        if (!op_py && !op_pz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 0, 1, 1)), FACTOR_EDGE)); }
+
+        // --- 8 corner neighbors ---
+        if (!op_nx && !op_ny && !op_nz) { best = max(best, propagate_light(read_light(world_pos + vec3i(-1,-1,-1)), FACTOR_CORNER)); }
+        if (!op_px && !op_ny && !op_nz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 1,-1,-1)), FACTOR_CORNER)); }
+        if (!op_nx && !op_py && !op_nz) { best = max(best, propagate_light(read_light(world_pos + vec3i(-1, 1,-1)), FACTOR_CORNER)); }
+        if (!op_px && !op_py && !op_nz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 1, 1,-1)), FACTOR_CORNER)); }
+        
+        if (!op_nx && !op_ny && !op_pz) { best = max(best, propagate_light(read_light(world_pos + vec3i(-1,-1, 1)), FACTOR_CORNER)); }
+        if (!op_px && !op_ny && !op_pz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 1,-1, 1)), FACTOR_CORNER)); }
+        if (!op_nx && !op_py && !op_pz) { best = max(best, propagate_light(read_light(world_pos + vec3i(-1, 1, 1)), FACTOR_CORNER)); }
+        if (!op_px && !op_py && !op_pz) { best = max(best, propagate_light(read_light(world_pos + vec3i( 1, 1, 1)), FACTOR_CORNER)); }
+
+        light_out[idx] = pack_rgb10(best);
     }
-    return true; // Reached end of loop without hitting solid
-}
-
-@compute @workgroup_size(4, 4, 4)
-fn propagate(@builtin(global_invocation_id) gid: vec3<u32>) {
-    if gid.x >= GRID_SIZE || gid.y >= GRID_SIZE || gid.z >= GRID_SIZE {
-        return;
-    }
-
-    let packed = voxels[voxel_index(gid)];
-    let material_id = packed & 0x3FFFu;
-
-    // Palette lookup for emission check
-    let pu = material_id % 256u;
-    let pv = material_id / 256u;
-    let coords = vec2i(i32(pu), i32(pv));
-    
-    // Use Level 0 for palette lookups
-    // Use Level 0 for palette lookups
-    let albedo = textureLoad(t_palette, coords, 0, 0).rgb;
-    let props = textureLoad(t_palette, coords, 1, 0);
-    // Unpack props: R=Roughness, G=Emission, B=Noise, A=Metallic
-    let emission = props.g;
-
-    // Emission injection
-    var emit = vec3f(0.0);
-    if emission > 0.01 {
-        // Boost emission for visual punch
-        emit = albedo * emission * 5.0; 
-    }
-
-    // Sky light injected at top boundary
-    // Sky light injected at top boundary
-    // Dynamic Sky Color based on Sun
-    var sky = vec3f(0.0);
-    if gid.y == GRID_SIZE - 1u {
-        // Night base (deep blue) + Sun influence (orange/white)
-        let night_base = vec3f(0.02, 0.02, 0.05);
-        sky = globals.sun_color.rgb * 0.5 + night_base;
-    }
-
-    // Solid Block Logic:
-    // If I am solid, I just emit my own light. I do NOT receive light from neighbors.
-    // This ensures walls stop light.
-    if material_id != 0u {
-        textureStore(light_dst, gid, vec4f(emit, 1.0));
-        return;
-    }
-
-    // Air Block Logic:
-    // I am air. I gather light from my neighbors.
-    let pos = vec3i(gid);
-
-    // Initial value: Any sky light falling here + any intrinsic emission (air shouldn't emit, but for completeness)
-    var best = max(emit, sky);
-
-    // Neighbor Opacity Checks for occlusion logic
-    // We need to know if neighbors are opaque to block DIAGONAL propagation (leaks).
-    // But for FACE neighbors, we ALWAYS read them. If a face neighbor is a solid light source, we want its light.
-    let op_nx = is_opaque_at(pos + vec3i(-1, 0, 0));
-    let op_px = is_opaque_at(pos + vec3i( 1, 0, 0));
-    let op_ny = is_opaque_at(pos + vec3i( 0,-1, 0));
-    let op_py = is_opaque_at(pos + vec3i( 0, 1, 0));
-    let op_nz = is_opaque_at(pos + vec3i( 0, 0,-1));
-    let op_pz = is_opaque_at(pos + vec3i( 0, 0, 1));
-
-    // --- 6 face neighbors ---
-    // Read unconditionally.
-    best = max(best, propagate_light(read_light(pos + vec3i(-1, 0, 0)), FACTOR_FACE));
-    best = max(best, propagate_light(read_light(pos + vec3i( 1, 0, 0)), FACTOR_FACE));
-    best = max(best, propagate_light(read_light(pos + vec3i( 0,-1, 0)), FACTOR_FACE));
-
-    // --- Raytraced Sun Injection ---
-    // If I am AIR and I have a SOLID neighbor, check if the Sun hits that face.
-    
-    // The sun_dir vector points FROM sun TO world (e.g. Down).
-    // We need the vector FROM surface TO sun (e.g. Up).
-    let to_sun = -globals.sun_dir.xyz;
-
-    // Pre-calculate sun dot products for axes
-    // We want to know if the face normal aligns with the direction TO the sun.
-    let dot_nx = max(dot(vec3f( 1.0, 0.0, 0.0), to_sun), 0.0);
-    let dot_px = max(dot(vec3f(-1.0, 0.0, 0.0), to_sun), 0.0);
-    let dot_ny = max(dot(vec3f( 0.0, 1.0, 0.0), to_sun), 0.0); // Floor (Up normal)
-    let dot_nz = max(dot(vec3f( 0.0, 0.0, 1.0), to_sun), 0.0);
-    let dot_pz = max(dot(vec3f( 0.0, 0.0,-1.0), to_sun), 0.0);
-    
-    // Optimization: Check sun path ONCE per voxel if ANY face is aligned
-    var sun_visible = false;
-    let needs_check = (op_nx && dot_nx > 0.0) || (op_px && dot_px > 0.0) || 
-                      (op_ny && dot_ny > 0.0) || (op_nz && dot_nz > 0.0) || 
-                      (op_pz && dot_pz > 0.0);
-                      
-    if (needs_check) {
-        sun_visible = check_sun_path(pos, to_sun);
-    }
-
-    // Injection Intensity: Boost to make the sun spot act as a powerful lamp
-    let sun_boost = globals.sun_color.rgb * BOUNCE_INTENSITY;
-
-    if (sun_visible) {
-        if (op_nx && dot_nx > 0.0) { best = max(best, sun_boost * dot_nx); }
-        if (op_px && dot_px > 0.0) { best = max(best, sun_boost * dot_px); }
-        if (op_ny && dot_ny > 0.0) { best = max(best, sun_boost * dot_ny); } // Floor lit by sun
-        if (op_nz && dot_nz > 0.0) { best = max(best, sun_boost * dot_nz); }
-        if (op_pz && dot_pz > 0.0) { best = max(best, sun_boost * dot_pz); }
-    }
-
-    // Vertical neighbor (no special logic anymore)
-    let light_up = read_light(pos + vec3i(0, 1, 0));
-    best = max(best, propagate_light(light_up, FACTOR_FACE));
-    best = max(best, propagate_light(read_light(pos + vec3i( 0, 0,-1)), FACTOR_FACE));
-    best = max(best, propagate_light(read_light(pos + vec3i( 0, 0, 1)), FACTOR_FACE));
-
-    // --- 12 edge neighbors ---
-    // Propagate ONLY if BOTH adjacent face directions are not opaque (open).
-    if !op_nx && !op_ny { best = max(best, propagate_light(read_light(pos + vec3i(-1,-1, 0)), FACTOR_EDGE)); }
-    if !op_px && !op_ny { best = max(best, propagate_light(read_light(pos + vec3i( 1,-1, 0)), FACTOR_EDGE)); }
-    if !op_nx && !op_py { best = max(best, propagate_light(read_light(pos + vec3i(-1, 1, 0)), FACTOR_EDGE)); }
-    if !op_px && !op_py { best = max(best, propagate_light(read_light(pos + vec3i( 1, 1, 0)), FACTOR_EDGE)); }
-    
-    if !op_nx && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i(-1, 0,-1)), FACTOR_EDGE)); }
-    if !op_px && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i( 1, 0,-1)), FACTOR_EDGE)); }
-    if !op_nx && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i(-1, 0, 1)), FACTOR_EDGE)); }
-    if !op_px && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i( 1, 0, 1)), FACTOR_EDGE)); }
-    
-    if !op_ny && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i( 0,-1,-1)), FACTOR_EDGE)); }
-    if !op_py && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i( 0, 1,-1)), FACTOR_EDGE)); }
-    if !op_ny && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i( 0,-1, 1)), FACTOR_EDGE)); }
-    if !op_py && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i( 0, 1, 1)), FACTOR_EDGE)); }
-
-    // --- 8 corner neighbors ---
-    // Propagate ONLY if ALL THREE adjacent faces are not opaque.
-    if !op_nx && !op_ny && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i(-1,-1,-1)), FACTOR_CORNER)); }
-    if !op_px && !op_ny && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i( 1,-1,-1)), FACTOR_CORNER)); }
-    if !op_nx && !op_py && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i(-1, 1,-1)), FACTOR_CORNER)); }
-    if !op_px && !op_py && !op_nz { best = max(best, propagate_light(read_light(pos + vec3i( 1, 1,-1)), FACTOR_CORNER)); }
-    
-    if !op_nx && !op_ny && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i(-1,-1, 1)), FACTOR_CORNER)); }
-    if !op_px && !op_ny && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i( 1,-1, 1)), FACTOR_CORNER)); }
-    if !op_nx && !op_py && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i(-1, 1, 1)), FACTOR_CORNER)); }
-    if !op_px && !op_py && !op_pz { best = max(best, propagate_light(read_light(pos + vec3i( 1, 1, 1)), FACTOR_CORNER)); }
-
-    textureStore(light_dst, gid, vec4f(best, 1.0));
 }

@@ -1,9 +1,11 @@
 //! Turi — client application.
 
 mod assets;
+mod brick_map;
 mod camera;
 mod gpu;
 mod light;
+mod light_propagator;
 mod postprocess;
 mod renderer;
 mod settings;
@@ -22,9 +24,10 @@ use winit::window::{CursorGrabMode, Window, WindowId};
 
 use ara_core::glam;
 use ara_core::{
-    Action, BlockRegistry, GRID_SIZE, GlobalUniforms, InputManager, LightBuffer, PackedVoxel,
-    PointLight, dda_raycast,
+    Action, BlockRegistry, GlobalUniforms, InputManager, LightBuffer, MemoryBudget, PackedVoxel,
+    PointLight, WORLD_EXTENT, dda_raycast,
 };
+use brick_map::BrickMap;
 use camera::{FpsCamera, HaltonJitter};
 use gpu::GpuContext;
 use renderer::{AaMode, Renderer};
@@ -46,74 +49,6 @@ fn default_input_bindings() -> InputManager {
     input
 }
 
-/// Generate a 64x64x64 test voxel volume: checkerboard ground + lava pool.
-/// Generate a 64x64x64 room scene with walls and a moving lava block.
-fn generate_room_scene() -> Vec<PackedVoxel> {
-    let size = GRID_SIZE as usize;
-    let mut voxels = vec![PackedVoxel::AIR; size * size * size];
-
-    let ground_y = 10;
-    let ceiling_y = 50;
-    let min_xz = 10;
-    let max_xz = 53;
-
-    // Simple pseudo-random number generator for visual variants
-    let mut rng_seed = 12345u32;
-    let mut next_variant = || -> u8 {
-        rng_seed = rng_seed.wrapping_mul(1664525).wrapping_add(1013904223);
-        ((rng_seed >> 16) & 0xF) as u8
-    };
-
-    for z in 0..size {
-        for x in 0..size {
-            for y in 0..size {
-                let idx = z * size * size + y * size + x;
-
-                // Floor (Checkerboard)
-                if y == ground_y && x >= min_xz && x <= max_xz && z >= min_xz && z <= max_xz {
-                    // Stone (1) / Grass (3) checkerboard
-                    let mat = if (x + z) % 2 == 0 { 1u16 } else { 3u16 };
-                    // Use random variant for stone to test noise
-                    let variant = if mat == 1 { next_variant() } else { 0 };
-                    voxels[idx] = PackedVoxel::with_all(mat, 0, 0, variant, 0);
-                    continue;
-                }
-
-                // Ceiling (Wood)
-                if y == ceiling_y && x >= min_xz && x <= max_xz && z >= min_xz && z <= max_xz {
-                    voxels[idx] = PackedVoxel::new(6); // Wood
-                    continue;
-                }
-
-                // Walls (Stone)
-                if y > ground_y && y < ceiling_y {
-                    let is_wall_x = x == min_xz || x == max_xz;
-                    let is_wall_z = z == min_xz || z == max_xz;
-
-                    if (is_wall_x && z >= min_xz && z <= max_xz)
-                        || (is_wall_z && x >= min_xz && x <= max_xz)
-                    {
-                        // Assign random variant to wall stones too
-                        voxels[idx] = PackedVoxel::with_all(1, 0, 0, next_variant(), 0);
-                        continue;
-                    }
-                }
-            }
-        }
-    }
-
-    // Add some random pillars inside
-    for y in ground_y + 1..ground_y + 5 {
-        let idx1 = 20 * size * size + y * size + 20;
-        voxels[idx1] = PackedVoxel::new(2); // Dirt
-
-        let idx2 = 40 * size * size + y * size + 40;
-        voxels[idx2] = PackedVoxel::new(2); // Dirt
-    }
-
-    voxels
-}
-
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuContext>,
@@ -126,7 +61,7 @@ struct App {
     start_time: Instant,
     frame_count: u32,
     fps_update_time: Instant,
-    voxels: Vec<PackedVoxel>,
+    brick_map: Option<BrickMap>,
     selected_material: u16,
     target_block_name: Option<String>,
     jitter: HaltonJitter,
@@ -155,7 +90,7 @@ impl App {
             start_time: Instant::now(),
             frame_count: 0,
             fps_update_time: Instant::now(),
-            voxels: Vec::new(),
+            brick_map: None,
             selected_material: 1,
             target_block_name: None,
             jitter: HaltonJitter::new(8),
@@ -216,8 +151,8 @@ impl ApplicationHandler for App {
         let palette_data = registry.generate_texture_data();
         info!("Loaded {} block types", registry.block_count());
 
-        let test_voxels = generate_room_scene();
-        self.voxels = test_voxels.clone();
+        // Build Sparse Brick Map with test scene
+        let sbm = BrickMap::upload_test_scene(&gpu, MemoryBudget::Low);
         self.registry = Some(registry);
 
         let size = window.inner_size();
@@ -227,26 +162,27 @@ impl ApplicationHandler for App {
             size.width,
             size.height,
             &palette_data,
-            &test_voxels,
+            &sbm,
             self.settings.bloom_threshold,
             self.settings.bloom_intensity,
             self.settings.bloom_exposure,
+            self.settings.vsync,
         );
 
         let aspect = size.width as f32 / size.height.max(1) as f32;
         self.camera.set_aspect_ratio(aspect);
 
-        // Initialize prev_view_proj with camera's starting matrix for correct TAA on first frame
         let initial_view_proj = self.camera.view_proj().to_cols_array_2d();
         renderer.init_prev_view_proj(initial_view_proj);
 
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
+        self.brick_map = Some(sbm);
         self.last_frame_time = Some(Instant::now());
         self.start_time = Instant::now();
 
-        info!("Application initialized");
+        info!("Application initialized (Sparse Brick Map)");
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -303,6 +239,16 @@ impl ApplicationHandler for App {
                     return;
                 }
 
+                // F3: Toggle VSync
+                if key == KeyCode::F3 && state == ElementState::Pressed {
+                    if let (Some(gpu), Some(renderer)) = (&self.gpu, &mut self.renderer) {
+                        self.settings.vsync = !self.settings.vsync;
+                        renderer.set_vsync(gpu, self.settings.vsync);
+                        info!("VSync: {}", if self.settings.vsync { "On" } else { "Off" });
+                    }
+                    return;
+                }
+
                 match state {
                     ElementState::Pressed => self.input.key_down(key as u32),
                     ElementState::Released => self.input.key_up(key as u32),
@@ -319,35 +265,46 @@ impl ApplicationHandler for App {
                 }
 
                 let dir = self.camera.forward();
-                if let Some(hit) = dda_raycast(&self.voxels, self.camera.position, dir, 64.0) {
-                    if let (Some(gpu), Some(renderer)) = (&self.gpu, &self.renderer) {
-                        match button {
-                            MouseButton::Left => {
-                                self.voxels[hit.index] = PackedVoxel::AIR;
-                                renderer.update_voxel_at(gpu, hit.index, PackedVoxel::AIR);
-                            }
-                            MouseButton::Right => {
-                                let gs = GRID_SIZE as i32;
-                                let neighbor = hit.grid_pos + hit.normal;
-                                if neighbor.x >= 0
-                                    && neighbor.x < gs
-                                    && neighbor.y >= 0
-                                    && neighbor.y < gs
-                                    && neighbor.z >= 0
-                                    && neighbor.z < gs
-                                {
-                                    let idx = (neighbor.z * gs * gs + neighbor.y * gs + neighbor.x)
-                                        as usize;
-                                    // Prevent placing inside the camera
-                                    let cam_cell = self.camera.position.floor().as_ivec3();
-                                    if neighbor != cam_cell {
-                                        let voxel = PackedVoxel::new(self.selected_material);
-                                        self.voxels[idx] = voxel;
-                                        renderer.update_voxel_at(gpu, idx, voxel);
+                if let Some(sbm) = &mut self.brick_map {
+                    if let Some(hit) =
+                        dda_raycast(self.camera.position, dir, 64.0, |pos| sbm.get_voxel(pos))
+                    {
+                        if let Some(gpu) = &self.gpu {
+                            match button {
+                                MouseButton::Left => {
+                                    sbm.write_voxel(gpu, hit.grid_pos, PackedVoxel::AIR);
+                                    if let Some(renderer) = &self.renderer {
+                                        renderer.light_propagator.mark_dirty_radius(
+                                            gpu,
+                                            hit.grid_pos,
+                                            32,
+                                        );
                                     }
                                 }
+                                MouseButton::Right => {
+                                    let we = WORLD_EXTENT as i32;
+                                    let neighbor = hit.grid_pos + hit.normal;
+                                    if neighbor.x >= 0
+                                        && neighbor.x < we
+                                        && neighbor.y >= 0
+                                        && neighbor.y < we
+                                        && neighbor.z >= 0
+                                        && neighbor.z < we
+                                    {
+                                        let cam_cell = self.camera.position.floor().as_ivec3();
+                                        if neighbor != cam_cell {
+                                            let voxel = PackedVoxel::new(self.selected_material);
+                                            sbm.write_voxel(gpu, neighbor, voxel);
+                                            if let Some(renderer) = &self.renderer {
+                                                renderer
+                                                    .light_propagator
+                                                    .mark_dirty_radius(gpu, neighbor, 32);
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            _ => {}
                         }
                     }
                 }
@@ -378,51 +335,66 @@ impl ApplicationHandler for App {
                 // Debug HUD: raycast to find targeted block name
                 self.target_block_name = {
                     let dir = self.camera.forward();
-                    dda_raycast(&self.voxels, self.camera.position, dir, 64.0).and_then(|hit| {
-                        let voxel = self.voxels[hit.index];
-                        self.registry
-                            .as_ref()
-                            .and_then(|reg| reg.get_block_name(voxel.id()))
-                            .map(|s| s.to_owned())
-                    })
+                    if let Some(sbm) = &self.brick_map {
+                        dda_raycast(self.camera.position, dir, 64.0, |pos| sbm.get_voxel(pos))
+                            .and_then(|hit| {
+                                let voxel = sbm.get_voxel(hit.grid_pos);
+                                self.registry
+                                    .as_ref()
+                                    .and_then(|reg| reg.get_block_name(voxel.id()))
+                                    .map(|s| s.to_owned())
+                            })
+                    } else {
+                        None
+                    }
                 };
 
-                if let (Some(gpu), Some(renderer), Some(window)) =
-                    (&self.gpu, &mut self.renderer, &self.window)
-                {
+                if let (Some(gpu), Some(renderer), Some(window), Some(sbm)) = (
+                    &self.gpu,
+                    &mut self.renderer,
+                    &self.window,
+                    &mut self.brick_map,
+                ) {
                     let time = self.start_time.elapsed().as_secs_f32();
-                    let gs = GRID_SIZE as usize;
+                    let we = WORLD_EXTENT as usize;
 
-                    // Animated lava orb — partial writes only
+                    // Animated lava orb — write directly to brick map
                     let radius = 15.0;
                     let center_x = 32.0;
                     let center_z = 32.0;
-                    let y = 25usize;
+                    let y = 25i32;
 
                     let prev_angle = (time - dt) * 1.0;
-                    let prev_x = (center_x + radius * prev_angle.cos()) as usize;
-                    let prev_z = (center_z + radius * prev_angle.sin()) as usize;
+                    let prev_x = (center_x + radius * prev_angle.cos()) as i32;
+                    let prev_z = (center_z + radius * prev_angle.sin()) as i32;
 
-                    if prev_x < gs && prev_z < gs {
-                        let idx = prev_z * gs * gs + y * gs + prev_x;
-                        self.voxels[idx] = PackedVoxel::AIR;
-                        renderer.update_voxel_at(gpu, idx, PackedVoxel::AIR);
+                    if prev_x >= 0
+                        && (prev_x as usize) < we
+                        && prev_z >= 0
+                        && (prev_z as usize) < we
+                    {
+                        let pos = glam::IVec3::new(prev_x, y, prev_z);
+                        sbm.write_voxel(gpu, pos, PackedVoxel::AIR);
+                        renderer.light_propagator.mark_dirty_radius(gpu, pos, 32);
                     }
 
                     let angle = time * 1.0;
-                    let curr_x = (center_x + radius * angle.cos()) as usize;
-                    let curr_z = (center_z + radius * angle.sin()) as usize;
+                    let curr_x = (center_x + radius * angle.cos()) as i32;
+                    let curr_z = (center_z + radius * angle.sin()) as i32;
 
-                    if curr_x < gs && curr_z < gs {
-                        let idx = curr_z * gs * gs + y * gs + curr_x;
-                        self.voxels[idx] = PackedVoxel::new(8);
-                        renderer.update_voxel_at(gpu, idx, PackedVoxel::new(8));
+                    if curr_x >= 0
+                        && (curr_x as usize) < we
+                        && curr_z >= 0
+                        && (curr_z as usize) < we
+                    {
+                        let pos = glam::IVec3::new(curr_x, y, curr_z);
+                        sbm.write_voxel(gpu, pos, PackedVoxel::new(8));
+                        renderer.light_propagator.mark_dirty_radius(gpu, pos, 32);
                     }
 
                     let size = window.inner_size();
                     let (width, height) = (size.width as f32, size.height as f32);
 
-                    // Apply TAA jitter to camera (sub-pixel offset)
                     let jitter = if matches!(renderer.aa_mode(), AaMode::Taa | AaMode::TaaThenSmaa)
                     {
                         self.jitter.next()
@@ -431,24 +403,20 @@ impl ApplicationHandler for App {
                     };
                     self.camera.set_jitter(jitter);
 
-                    // Get view-projection matrices for TAA
-                    // For CORRECT velocity calculation, we must use UNJITTERED matrices
-                    // The jitter is only for sampling different sub-pixel positions during rendering
                     let prev_view_proj_unjittered = renderer.prev_view_proj();
                     let curr_view_proj_unjittered = self.camera.view_proj().to_cols_array_2d();
-                    // Note: view_proj_jittered is applied via camera.set_jitter() and used via proj_inverse_jittered
                     let _curr_view_proj_jittered = self
                         .camera
                         .view_proj_jittered(width, height)
                         .to_cols_array_2d();
 
-                    // Use jittered inverse projection for raytracing
                     let proj_inverse_jittered = self
                         .camera
                         .proj_inverse_jittered(width, height)
                         .to_cols_array_2d();
 
                     let s = &self.settings;
+                    let wo = sbm.world_origin();
                     let uniforms = GlobalUniforms::with_view_proj(
                         self.camera.view_inverse().to_cols_array_2d(),
                         proj_inverse_jittered,
@@ -464,27 +432,33 @@ impl ApplicationHandler for App {
                         s.light_max_distance,
                         {
                             let dir = self.camera.forward();
-                            dda_raycast(&self.voxels, self.camera.position, dir, 10.0)
+                            dda_raycast(self.camera.position, dir, 10.0, |pos| sbm.get_voxel(pos))
                                 .map(|hit| hit.grid_pos.to_array())
                         },
                         prev_view_proj_unjittered,
                         curr_view_proj_unjittered,
+                        [wo[0] as f32, wo[1] as f32, wo[2] as f32],
+                        self.frame_count as f32,
                     );
 
                     // Dynamic Lights
                     let mut lights = LightBuffer::default();
 
-                    // 1. Player Torch (warm light)
+                    // Player Torch
                     lights.lights[0] = PointLight {
-                        position: (self.camera.position + self.camera.forward() * 0.5).extend(8.0), // radius = 8.0
-                        color: glam::Vec4::new(1.0, 0.6, 0.3, 2.0), // intensity = 2.0
-                        flags: 1,                                   // Shadows enabled (maybe?)
+                        position: (self.camera.position + self.camera.forward() * 0.5).extend(8.0),
+                        color: glam::Vec4::new(1.0, 0.6, 0.3, 2.0),
+                        flags: 1,
                         padding: [0; 3],
                     };
                     lights.count += 1;
 
-                    // 2. Lava Orb Light (red/orange)
-                    if curr_x < gs && curr_z < gs {
+                    // Lava Orb Light
+                    if curr_x >= 0
+                        && (curr_x as usize) < we
+                        && curr_z >= 0
+                        && (curr_z as usize) < we
+                    {
                         lights.lights[lights.count as usize] = PointLight {
                             position: glam::Vec4::new(
                                 curr_x as f32 + 0.5,
@@ -493,7 +467,7 @@ impl ApplicationHandler for App {
                                 12.0,
                             ),
                             color: glam::Vec4::new(1.0, 0.2, 0.0, 3.0),
-                            flags: 0, // No shadows for now to save perf or if inside block
+                            flags: 0,
                             padding: [0; 3],
                         };
                         lights.count += 1;
@@ -523,9 +497,6 @@ impl ApplicationHandler for App {
                         }
                     }
 
-                    // Update prev_view_proj AFTER rendering for NEXT frame's velocity calculation.
-                    // Store the CURRENT frame's UNJITTERED matrix so next frame can use it as "previous".
-                    // This must be done AFTER render() so the CURRENT frame uses the correct prev/current pair.
                     renderer.update_prev_view_proj(curr_view_proj_unjittered);
                 }
 
