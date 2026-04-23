@@ -9,6 +9,7 @@ pub struct VctPipeline {
     inject_bind_group: wgpu::BindGroup,
     mipmap_pipeline: wgpu::ComputePipeline,
     mipmap_bind_group: wgpu::BindGroup,
+    dirty: bool,
 }
 
 impl VctPipeline {
@@ -171,7 +172,7 @@ impl VctPipeline {
             cache: None,
         });
 
-        // LOD mipmap BGL (same buffers, read_write on brick_pool + radiance_pool)
+        // LOD mipmap BGL — reads top_grid, brick_pool, brick_headers; writes radiance_pool
         let mipmap_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("VCT LOD Mipmap BGL"),
             entries: &[
@@ -189,7 +190,7 @@ impl VctPipeline {
                     binding: 1,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -271,10 +272,29 @@ impl VctPipeline {
             inject_bind_group,
             mipmap_pipeline,
             mipmap_bind_group,
+            dirty: true,
         }
     }
 
-    /// Run sun injection then LOD mipmap (LOD0→1, LOD1→2).
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    pub fn needs_update(&self) -> bool {
+        self.dirty
+    }
+
+    /// Run sun injection + LOD mipmap only if dirty. Returns whether it ran.
+    pub fn execute_if_dirty(&mut self, encoder: &mut wgpu::CommandEncoder, max_bricks: u32) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        self.inject(encoder, max_bricks);
+        self.mipmap(encoder, max_bricks);
+        self.dirty = false;
+        true
+    }
+
     pub fn inject(&self, encoder: &mut wgpu::CommandEncoder, max_bricks: u32) {
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("VCT Sun Inject Pass"),
@@ -282,29 +302,29 @@ impl VctPipeline {
         });
         pass.set_pipeline(&self.inject_pipeline);
         pass.set_bind_group(0, &self.inject_bind_group, &[]);
-        pass.dispatch_workgroups(max_bricks, 2, 1);
+        let (x, z) = brick_dispatch_dims(max_bricks);
+        pass.dispatch_workgroups(x, 2, z);
     }
 
     pub fn mipmap(&self, encoder: &mut wgpu::CommandEncoder, max_bricks: u32) {
-        {
+        let (x, z) = brick_dispatch_dims(max_bricks);
+        for lod in 1..ara_core::LOD_COUNT {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("VCT LOD Mipmap LOD1"),
+                label: Some("VCT LOD Mipmap"),
                 timestamp_writes: None,
             });
             pass.set_pipeline(&self.mipmap_pipeline);
             pass.set_bind_group(0, &self.mipmap_bind_group, &[]);
-            pass.set_push_constants(0, bytemuck::bytes_of(&1u32));
-            pass.dispatch_workgroups(max_bricks, 2, 1);
-        }
-        {
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("VCT LOD Mipmap LOD2"),
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(&self.mipmap_pipeline);
-            pass.set_bind_group(0, &self.mipmap_bind_group, &[]);
-            pass.set_push_constants(0, bytemuck::bytes_of(&2u32));
-            pass.dispatch_workgroups(max_bricks, 2, 1);
+            pass.set_push_constants(0, bytemuck::bytes_of(&lod));
+            pass.dispatch_workgroups(x, 2, z);
         }
     }
+}
+
+/// Splits brick count across X and Z dispatch dimensions to stay within the 65535 per-dim limit.
+/// Shaders recover brick_idx as `wg.x + wg.z * 65535`.
+fn brick_dispatch_dims(max_bricks: u32) -> (u32, u32) {
+    let x = max_bricks.min(65535);
+    let z = (max_bricks + 65534) / 65535;
+    (x, z)
 }

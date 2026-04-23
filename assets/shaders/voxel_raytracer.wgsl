@@ -54,7 +54,7 @@ const BRICK_SIZE: u32 = 8u;
 const BRICK_SHIFT: u32 = 3u;
 const BRICK_VOLUME: u32 = 512u;
 const TOP_GRID_SIZE: u32 = 64u;
-const LOD_COUNT: u32 = 3u;
+const LOD_COUNT: u32 = 8u;
 const WORLD_EXTENT: u32 = 512u;
 const BRICK_EMPTY: u32 = 0xFFFFFFFFu;
 const MAX_STEPS: u32 = 512u;
@@ -227,20 +227,33 @@ fn dda_march(origin: vec3f, dir: vec3f) -> HitResult {
     var current_t = 0.0;
 
     for (var lod = 0u; lod < LOD_COUNT; lod++) {
-        let voxel_size = f32(1u << lod);
-        let brick_size = 8.0 * voxel_size;
-        let radius = 256.0 * voxel_size;
-        
-        let bounds = ray_aabb(origin, inv_dir, cam - vec3f(radius), cam + vec3f(radius));
+        let voxel_size_i: i32 = 1i << lod;
+        let brick_size_i: i32 = 8i << lod;
+        let radius_i: i32    = 256i << lod;
+        let voxel_size = f32(voxel_size_i);
+        let brick_size = f32(brick_size_i);
+        let radius     = f32(radius_i);
+
+        // Positive AABB face = exact allocated boundary for this LOD:
+        // (floor(cam/brick_size) + 32) * brick_size = floor(cam/brick_size)*brick_size + radius.
+        // LOD(N+1) may enter its first brick mid-way on odd origins, but the missed
+        // voxels are at positions already covered by the last LOD N brick.
+        let box_max = floor(cam / brick_size) * brick_size + vec3f(radius) - vec3f(1.0);
+        let bounds = ray_aabb(origin, inv_dir, cam - vec3f(radius), box_max);
         let t_enter = max(max(bounds.x, current_t), 0.0);
         let t_exit = bounds.y;
 
         if (t_enter > t_exit || t_exit < 0.0) { continue; }
 
-        let entry_pos = origin + dir * (t_enter + 0.0001);
+        // Epsilon scaled to voxel size so it always lands inside the correct voxel.
+        let entry_pos = origin + dir * (t_enter + 0.001 * voxel_size);
 
-        var macro_pos = entry_pos / brick_size;
-        var macro_cell = vec3i(floor(macro_pos));
+        var macro_cell = vec3i(
+            floor_div(i32(floor(entry_pos.x)), brick_size_i),
+            floor_div(i32(floor(entry_pos.y)), brick_size_i),
+            floor_div(i32(floor(entry_pos.z)), brick_size_i),
+        );
+        let macro_pos = entry_pos / brick_size;
 
         let t_delta_macro = t_delta_base * brick_size;
         var t_max_macro = (vec3f(macro_cell) + max(step_f, vec3f(0.0)) - macro_pos) * inv_dir * brick_size + t_enter;
@@ -255,13 +268,16 @@ fn dda_march(origin: vec3f, dir: vec3f) -> HitResult {
             let brick_idx = top_grid[grid_idx];
 
             if (brick_idx != BRICK_EMPTY) {
-                let inner_entry = origin + dir * (t_current + 0.0001);
-                var micro_pos = inner_entry / voxel_size;
-                var micro_cell = vec3i(floor(micro_pos));
-
+                let inner_entry = origin + dir * (t_current + 0.001 * voxel_size);
+                var micro_cell = vec3i(
+                    floor_div(i32(floor(inner_entry.x)), voxel_size_i),
+                    floor_div(i32(floor(inner_entry.y)), voxel_size_i),
+                    floor_div(i32(floor(inner_entry.z)), voxel_size_i),
+                );
                 let min_cell = macro_cell * 8;
                 let max_cell = min_cell + vec3i(7);
                 micro_cell = clamp(micro_cell, min_cell, max_cell);
+                let micro_pos = clamp(inner_entry / voxel_size, vec3f(micro_cell), vec3f(micro_cell) + vec3f(1.0) - vec3f(1e-4));
 
                 let t_delta_micro = t_delta_base * voxel_size;
                 var t_max_micro = (vec3f(micro_cell) + max(step_f, vec3f(0.0)) - micro_pos) * inv_dir * voxel_size + t_current;
@@ -270,9 +286,9 @@ fn dda_march(origin: vec3f, dir: vec3f) -> HitResult {
                 
                 var inside_brick = true;
                 while (inside_brick) {
-                    let lx = u32(micro_cell.x) & 7u;
-                    let ly = u32(micro_cell.y) & 7u;
-                    let lz = u32(micro_cell.z) & 7u;
+                    let lx = u32(micro_cell.x & 7);
+                    let ly = u32(micro_cell.y & 7);
+                    let lz = u32(micro_cell.z & 7);
                     
                     let linear_idx = lz * 64u + ly * 8u + lx;
                     let word_idx = linear_idx >> 5u;
@@ -541,22 +557,22 @@ fn trace_cone(origin: vec3f, normal: vec3f, dir: vec3f, half_angle: f32, max_dis
     let safe_origin = origin + normal * 0.51;
     var t = 1.0;
 
-    for (var i = 0u; i < 64u; i++) {
+    for (var i = 0u; i < 32u; i++) {
         if (alpha >= 0.95 || t > max_dist) { break; }
 
         let diameter = max(1.0, 2.0 * t * tan_half);
         let pos = safe_origin + dir * t;
-        
+
         let s = sample_voxel_continuous(pos, diameter);
 
         let occlusion_bias = select(1.5, 1.0, diameter <= 1.0);
         let opacity_step = clamp(s.a * occlusion_bias, 0.0, 1.0);
         let a = opacity_step * (1.0 - alpha);
-        
+
         let radiance = select(vec3f(0.0), s.rgb / s.a, s.a > 0.001);
         color += radiance * a;
         alpha += a;
-        
+
         t += max(0.5, diameter * 0.25);
     }
     return color;
@@ -571,31 +587,28 @@ fn cone_trace_diffuse(origin: vec3f, normal: vec3f) -> vec3f {
     }
     let bitang = cross(normal, tang);
 
-    let half_angle = 0.5236; 
-    let max_dist = 128.0;
+    let half_angle = 0.5236;
+    let max_dist = 64.0;
 
-    var result = trace_cone(origin, normal, normal, half_angle, max_dist) * 0.3;
+    // 3 cones: center + 2 tilted (reduced from 5 for performance)
+    var result = trace_cone(origin, normal, normal, half_angle, max_dist) * 0.4;
 
-    let tilt = 0.5236; 
+    let tilt = 0.5236;
     let cos_t = cos(tilt);
     let sin_t = sin(tilt);
 
     let d0 = normalize(normal * cos_t + tang * sin_t);
     let d1 = normalize(normal * cos_t - tang * sin_t);
-    let d2 = normalize(normal * cos_t + bitang * sin_t);
-    let d3 = normalize(normal * cos_t - bitang * sin_t);
 
-    result += trace_cone(origin, normal, d0, half_angle, max_dist) * 0.175;
-    result += trace_cone(origin, normal, d1, half_angle, max_dist) * 0.175;
-    result += trace_cone(origin, normal, d2, half_angle, max_dist) * 0.175;
-    result += trace_cone(origin, normal, d3, half_angle, max_dist) * 0.175;
+    result += trace_cone(origin, normal, d0, half_angle, max_dist) * 0.3;
+    result += trace_cone(origin, normal, d1, half_angle, max_dist) * 0.3;
 
     return result;
 }
 
 fn cone_trace_specular(origin: vec3f, reflect_dir: vec3f, normal: vec3f, roughness: f32) -> vec3f {
     let half_angle = max(0.035, roughness * 0.35);
-    return trace_cone(origin, normal, reflect_dir, half_angle, 128.0);
+    return trace_cone(origin, normal, reflect_dir, half_angle, 64.0);
 }
 fn sample_flood_light(pos: vec3f) -> vec3f {
     let p0 = vec3i(floor(pos - 0.5));
@@ -642,11 +655,11 @@ fn shade_pbr(hit: HitResult, dir: vec3f, screen_pos: vec2f) -> vec3f {
     let sample_pos = hit.pos + hit.normal * 0.5;
     let flood_light = sample_flood_light(sample_pos);
 
-    let diffuse_gi = vec3f(0.0); // cone_trace_diffuse(hit.pos, hit.normal);
+    let diffuse_gi = cone_trace_diffuse(hit.pos, hit.normal);
 
     let view_dir = normalize(globals.cam_pos.xyz - hit.pos);
     let reflect_dir = reflect(-view_dir, hit.normal);
-    let specular_gi = vec3f(0.0); // cone_trace_specular(hit.pos, reflect_dir, hit.normal, roughness);
+    let specular_gi = cone_trace_specular(hit.pos, reflect_dir, hit.normal, roughness);
 
     let indirect = diffuse_gi + specular_gi * metallic + flood_light;
     
@@ -671,7 +684,9 @@ fn shade_pbr(hit: HitResult, dir: vec3f, screen_pos: vec2f) -> vec3f {
         dynamic_light += evaluate_point_light(point_lights.lights[i], hit.pos, hit.normal);
     }
 
-    let total_light = sun_light + indirect * ao + dynamic_light * ao;
+    // Hemispherical sky ambient: 1.0 for upward faces, 0.5 for side faces, 0.0 for downward.
+    let sky_ambient = globals.sky_color.rgb * globals.sky_color.a * (hit.normal.y * 0.5 + 0.5);
+    let total_light = sun_light + indirect * ao + dynamic_light * ao + sky_ambient;
 
     let noise_scale = 150.0;
     let bump_intensity = 0.08;

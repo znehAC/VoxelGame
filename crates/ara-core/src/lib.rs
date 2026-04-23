@@ -40,7 +40,7 @@ pub const BRICK_VOLUME: u32 = 512;
 pub const TOP_GRID_SIZE: u32 = 64;
 
 /// Total entries in the top grid (64³).
-pub const LOD_COUNT: u32 = 3;
+pub const LOD_COUNT: u32 = 8;
 pub const TOP_GRID_VOLUME: u32 = 262_144;
 
 /// Total voxels per axis (TOP_GRID_SIZE * BRICK_SIZE = 512).

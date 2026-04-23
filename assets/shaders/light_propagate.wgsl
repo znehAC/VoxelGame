@@ -26,9 +26,9 @@ struct GlobalUniforms {
     world_origin: vec4f,
 }
 
-const FACTOR_FACE: f32 = 0.80;
-const FACTOR_EDGE: f32 = 0.81;
-const FACTOR_CORNER: f32 = 0.729;
+const FACTOR_FACE: f32 = 0.93;
+const FACTOR_EDGE: f32 = 0.90;
+const FACTOR_CORNER: f32 = 0.88;
 const BOUNCE_INTENSITY: f32 = 0.2;
 const MAX_SHADOW_STEPS: u32 = 48u;
 
@@ -250,13 +250,6 @@ fn propagate(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid
         } else {
             if (!op_py) {
                  sky_visible = trace_upwards(world_pos);
-            }
-            
-            if (!sky_visible) {
-                 if (!op_nx && trace_upwards(world_pos + vec3i(-1, 0, 0))) { sky_visible = true; }
-                 else if (!op_px && trace_upwards(world_pos + vec3i( 1, 0, 0))) { sky_visible = true; }
-                 else if (!op_nz && trace_upwards(world_pos + vec3i( 0, 0,-1))) { sky_visible = true; }
-                 else if (!op_pz && trace_upwards(world_pos + vec3i( 0, 0, 1))) { sky_visible = true; }
             }
         }
 

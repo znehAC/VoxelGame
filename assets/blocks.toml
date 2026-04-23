@@ -1,9 +1,9 @@
 [[block]]
-id = "ara:stone"
-name = "Stone"
-color = "#808080"
-roughness = 0.9
-noise = 0.7
+id = "ara:grass"
+name = "Grass"
+color = "#4CAF50"
+roughness = 0.85
+noise = 0.2
 
 [[block]]
 id = "ara:dirt"
@@ -13,11 +13,11 @@ roughness = 0.95
 noise = 0.3
 
 [[block]]
-id = "ara:grass"
-name = "Grass"
-color = "#4CAF50"
-roughness = 0.85
-noise = 0.2
+id = "ara:stone"
+name = "Stone"
+color = "#808080"
+roughness = 0.9
+noise = 0.7
 
 [[block]]
 id = "ara:sand"

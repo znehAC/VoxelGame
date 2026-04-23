@@ -3,12 +3,14 @@
 mod assets;
 mod brick_map;
 mod camera;
+mod chunk_streamer;
 mod gpu;
 mod light;
 mod light_propagator;
 mod postprocess;
 mod renderer;
 mod settings;
+mod terrain_pipeline;
 mod ui;
 
 use std::sync::Arc;
@@ -29,8 +31,10 @@ use ara_core::{
 };
 use brick_map::BrickMap;
 use camera::{FpsCamera, HaltonJitter};
+use chunk_streamer::ChunkStreamer;
 use gpu::GpuContext;
 use renderer::{AaMode, Renderer};
+use terrain_pipeline::TerrainPipeline;
 
 const WINDOW_TITLE: &str = "Turi";
 const INITIAL_WIDTH: u32 = 1280;
@@ -62,6 +66,8 @@ struct App {
     frame_count: u32,
     fps_update_time: Instant,
     brick_map: Option<BrickMap>,
+    streamer: Option<ChunkStreamer>,
+    terrain_pipeline: Option<TerrainPipeline>,
     selected_material: u16,
     target_block_name: Option<String>,
     jitter: HaltonJitter,
@@ -91,6 +97,8 @@ impl App {
             frame_count: 0,
             fps_update_time: Instant::now(),
             brick_map: None,
+            streamer: None,
+            terrain_pipeline: None,
             selected_material: 1,
             target_block_name: None,
             jitter: HaltonJitter::new(8),
@@ -151,8 +159,12 @@ impl ApplicationHandler for App {
         let palette_data = registry.generate_texture_data();
         info!("Loaded {} block types", registry.block_count());
 
-        // Build Sparse Brick Map with test scene
-        let sbm = BrickMap::upload_test_scene(&gpu, MemoryBudget::Low);
+        // Build Sparse Brick Map with GPU-driven terrain generation
+        let mut sbm = BrickMap::new(&gpu, MemoryBudget::High);
+        let terrain = TerrainPipeline::new(&gpu, &sbm, 256);
+        let mut streamer = ChunkStreamer::new(128);
+        let spawn_pos = glam::Vec3::new(256.0, 100.0, 256.0);
+        streamer.initial_load(spawn_pos, &mut sbm, &terrain, &gpu);
         self.registry = Some(registry);
 
         let size = window.inner_size();
@@ -179,6 +191,8 @@ impl ApplicationHandler for App {
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
         self.brick_map = Some(sbm);
+        self.streamer = Some(streamer);
+        self.terrain_pipeline = Some(terrain);
         self.last_frame_time = Some(Instant::now());
         self.start_time = Instant::now();
 
@@ -273,8 +287,8 @@ impl ApplicationHandler for App {
                             match button {
                                 MouseButton::Left => {
                                     sbm.write_voxel(gpu, hit.grid_pos, PackedVoxel::AIR);
-                                    if let Some(renderer) = &self.renderer {
-                                        renderer.light_propagator.mark_dirty_radius(
+                                    if let Some(renderer) = &mut self.renderer {
+                                        renderer.mark_light_dirty_radius(
                                             gpu,
                                             hit.grid_pos,
                                             32,
@@ -295,10 +309,8 @@ impl ApplicationHandler for App {
                                         if neighbor != cam_cell {
                                             let voxel = PackedVoxel::new(self.selected_material);
                                             sbm.write_voxel(gpu, neighbor, voxel);
-                                            if let Some(renderer) = &self.renderer {
-                                                renderer
-                                                    .light_propagator
-                                                    .mark_dirty_radius(gpu, neighbor, 32);
+                                            if let Some(renderer) = &mut self.renderer {
+                                                renderer.mark_light_dirty_radius(gpu, neighbor, 32);
                                             }
                                         }
                                     }
@@ -349,48 +361,24 @@ impl ApplicationHandler for App {
                     }
                 };
 
-                if let (Some(gpu), Some(renderer), Some(window), Some(sbm)) = (
+                if let (Some(gpu), Some(renderer), Some(window), Some(sbm), Some(streamer), Some(terrain)) = (
                     &self.gpu,
                     &mut self.renderer,
                     &self.window,
                     &mut self.brick_map,
+                    &mut self.streamer,
+                    &self.terrain_pipeline,
                 ) {
+                    // Stream terrain: evict/load bricks around camera, dispatch GPU terrain gen.
+                    {
+                        let mut enc = gpu.device().create_command_encoder(
+                            &wgpu::CommandEncoderDescriptor { label: Some("Terrain Stream") },
+                        );
+                        streamer.update(self.camera.position, sbm, terrain, &mut enc, gpu);
+                        gpu.queue().submit(std::iter::once(enc.finish()));
+                    }
                     let time = self.start_time.elapsed().as_secs_f32();
-                    let we = WORLD_EXTENT as usize;
-
-                    // Animated lava orb — write directly to brick map
-                    let radius = 15.0;
-                    let center_x = 32.0;
-                    let center_z = 32.0;
-                    let y = 25i32;
-
-                    let prev_angle = (time - dt) * 1.0;
-                    let prev_x = (center_x + radius * prev_angle.cos()) as i32;
-                    let prev_z = (center_z + radius * prev_angle.sin()) as i32;
-
-                    if prev_x >= 0
-                        && (prev_x as usize) < we
-                        && prev_z >= 0
-                        && (prev_z as usize) < we
-                    {
-                        let pos = glam::IVec3::new(prev_x, y, prev_z);
-                        sbm.write_voxel(gpu, pos, PackedVoxel::AIR);
-                        renderer.light_propagator.mark_dirty_radius(gpu, pos, 32);
-                    }
-
-                    let angle = time * 1.0;
-                    let curr_x = (center_x + radius * angle.cos()) as i32;
-                    let curr_z = (center_z + radius * angle.sin()) as i32;
-
-                    if curr_x >= 0
-                        && (curr_x as usize) < we
-                        && curr_z >= 0
-                        && (curr_z as usize) < we
-                    {
-                        let pos = glam::IVec3::new(curr_x, y, curr_z);
-                        sbm.write_voxel(gpu, pos, PackedVoxel::new(8));
-                        renderer.light_propagator.mark_dirty_radius(gpu, pos, 32);
-                    }
+                    let _time = time; // used for future dynamic objects
 
                     let size = window.inner_size();
                     let (width, height) = (size.width as f32, size.height as f32);
@@ -453,25 +441,6 @@ impl ApplicationHandler for App {
                     };
                     lights.count += 1;
 
-                    // Lava Orb Light
-                    if curr_x >= 0
-                        && (curr_x as usize) < we
-                        && curr_z >= 0
-                        && (curr_z as usize) < we
-                    {
-                        lights.lights[lights.count as usize] = PointLight {
-                            position: glam::Vec4::new(
-                                curr_x as f32 + 0.5,
-                                25.0 + 0.5,
-                                curr_z as f32 + 0.5,
-                                12.0,
-                            ),
-                            color: glam::Vec4::new(1.0, 0.2, 0.0, 3.0),
-                            flags: 0,
-                            padding: [0; 3],
-                        };
-                        lights.count += 1;
-                    }
 
                     match renderer.render(
                         gpu,
@@ -500,16 +469,32 @@ impl ApplicationHandler for App {
                     renderer.update_prev_view_proj(curr_view_proj_unjittered);
                 }
 
-                // FPS counter + target block in window title
+                // FPS counter + debug info in window title
                 self.frame_count += 1;
                 let elapsed = self.fps_update_time.elapsed().as_secs_f32();
                 if elapsed >= 1.0 {
                     let fps = self.frame_count as f32 / elapsed;
                     let frame_ms = elapsed * 1000.0 / self.frame_count as f32;
-                    let block_label = self.target_block_name.as_deref().unwrap_or("---");
+                    let pos = self.camera.position;
+                    let yaw_deg = self.camera.yaw.to_degrees();
+                    let pitch_deg = self.camera.pitch.to_degrees();
+                    // yaw=0 → -Z (North), yaw=90 → +X (East)
+                    let dir = match (((yaw_deg % 360.0) + 360.0) % 360.0) as u32 {
+                        315..=360 | 0..=44  => "N",
+                        45..=134            => "E",
+                        135..=224           => "S",
+                        _                   => "W",
+                    };
+                    let (lod0_orig, pool_pct) = self.brick_map.as_ref().map(|bm| {
+                        let o = bm.lod_origin(0);
+                        (format!("[{},{},{}]", o[0], o[1], o[2]), bm.utilization() * 100.0)
+                    }).unwrap_or_default();
                     if let Some(window) = &self.window {
                         window.set_title(&format!(
-                            "{WINDOW_TITLE} | {block_label} | {fps:.0} FPS ({frame_ms:.1} ms)"
+                            "{WINDOW_TITLE} | {fps:.0} FPS ({frame_ms:.1}ms) | \
+                             pos({:.0},{:.0},{:.0}) yaw{yaw_deg:.0}°{dir} pitch{pitch_deg:.0}° | \
+                             lod0:{lod0_orig} pool:{pool_pct:.0}%",
+                            pos.x, pos.y, pos.z
                         ));
                     }
                     self.frame_count = 0;

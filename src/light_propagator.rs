@@ -1,6 +1,17 @@
 use crate::gpu::GpuContext;
 use ara_core::bytemuck;
 
+/// Why the light map needs recomputation.
+#[derive(Debug, Clone)]
+pub enum LightDirtyReason {
+    /// Initial load or chunk streaming
+    ChunkLoaded,
+    /// Block placed or removed
+    BlockEdited { pos: ara_core::glam::IVec3 },
+    /// Sun angle or sky color changed
+    TimeOfDay,
+}
+
 pub struct LightPropagator {
     pipeline: wgpu::ComputePipeline,
     compaction_pipeline: wgpu::ComputePipeline,
@@ -13,6 +24,8 @@ pub struct LightPropagator {
     pub active_chunks_buf: wgpu::Buffer,
     pub indirect_args_buf: wgpu::Buffer,
     pub first_frame: bool,
+    dirty: bool,
+    propagation_iterations: u32,
 }
 
 impl LightPropagator {
@@ -358,7 +371,37 @@ impl LightPropagator {
             active_chunks_buf,
             indirect_args_buf,
             first_frame: true,
+            dirty: true,
+            propagation_iterations: 20,
         }
+    }
+
+    /// Mark the light map as needing recomputation.
+    pub fn mark_dirty(&mut self, _reason: LightDirtyReason) {
+        self.dirty = true;
+    }
+
+    pub fn needs_update(&self) -> bool {
+        self.dirty
+    }
+
+    pub fn set_iterations(&mut self, iterations: u32) {
+        self.propagation_iterations = iterations;
+    }
+
+    /// Only execute propagation if marked dirty. Returns whether it ran.
+    pub fn execute_if_dirty(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        gpu: &GpuContext,
+    ) -> bool {
+        if !self.dirty {
+            return false;
+        }
+        let iters = self.propagation_iterations;
+        self.execute(encoder, iters, gpu);
+        self.dirty = false;
+        true
     }
 
     pub fn execute(
@@ -411,11 +454,12 @@ impl LightPropagator {
 
     /// Mark a specific 8x8x8 chunk as dirty when a block is placed/broken
     pub fn mark_dirty_radius(
-        &self,
+        &mut self,
         gpu: &GpuContext,
         world_pos: ara_core::glam::IVec3,
         radius: i32,
     ) {
+        self.dirty = true;
         let origin = ara_core::glam::IVec3::ZERO; // Replace with actual tracked origin later
         let rel = world_pos - origin;
 

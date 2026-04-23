@@ -37,6 +37,12 @@ fn top_grid_index(bx: u32, by: u32, bz: u32) -> u32 {
     return (bz % tgs) * tgs * tgs + (by % tgs) * tgs + (bx % tgs);
 }
 
+// Sign-extend a 10-bit unsigned value to i32 (bit 9 is the sign bit).
+fn sign10(v: u32) -> i32 {
+    let n = i32(v & 0x3FFu);
+    return select(n, n - 1024, (v & 0x200u) != 0u);
+}
+
 fn sbm_read_voxel(world_pos: vec3i) -> u32 {
     if (world_pos.x < 0 || world_pos.y < 0 || world_pos.z < 0 ||
         world_pos.x >= i32(WORLD_EXTENT) || world_pos.y >= i32(WORLD_EXTENT) || world_pos.z >= i32(WORLD_EXTENT)) {
@@ -112,31 +118,32 @@ fn check_sun_path_dda(origin: vec3i, dir: vec3f) -> bool {
 
 @compute @workgroup_size(8, 8, 4)
 fn inject(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: vec3u) {
-    let brick_idx = wg.x;
+    let brick_idx = wg.x + wg.z * 65535u;
+    if (brick_idx >= arrayLength(&brick_headers)) { return; }
     let header = brick_headers[brick_idx];
     if (header.x == 0xFFFFFFFFu || ((header.x >> 30u) & 0x3u) != 0u) { return; }
 
     let packed_coord = header.x & 0x3FFFFFFFu;
-    let bx = packed_coord & 0x3FFu;
-    let by = (packed_coord >> 10u) & 0x3FFu;
-    let bz = (packed_coord >> 20u) & 0x3FFu;
+    let bx: i32 = sign10(packed_coord);
+    let by: i32 = sign10(packed_coord >> 10u);
+    let bz: i32 = sign10(packed_coord >> 20u);
 
     let lx = i32(lid.x);
     let ly = i32(lid.y);
     let lz = i32(wg.y * 4u + lid.z);
-    
+
     let linear = u32(lz) * 64u + u32(ly) * 8u + u32(lx);
     let occ_word = brick_occupancy[brick_idx * 16u + (linear >> 5u)];
-    
+
     if ((occ_word & (1u << (linear & 31u))) == 0u) {
         radiance_pool[brick_idx * 512u + linear] = vec2u(0u, 0u);
         return;
     }
 
-    let world_pos = vec3i(i32(bx * 8u) + lx, i32(by * 8u) + ly, i32(bz * 8u) + lz);
+    let world_pos = vec3i(bx * 8 + lx, by * 8 + ly, bz * 8 + lz);
     let mat_id = sbm_read_voxel(world_pos) & 0x1FFu;
 
-    let is_surface = 
+    let is_surface =
         !fast_neighbor_opaque(brick_idx, world_pos + vec3i(1, 0, 0), lx + 1, ly, lz) ||
         !fast_neighbor_opaque(brick_idx, world_pos - vec3i(1, 0, 0), lx - 1, ly, lz) ||
         !fast_neighbor_opaque(brick_idx, world_pos + vec3i(0, 1, 0), lx, ly + 1, lz) ||
@@ -145,14 +152,17 @@ fn inject(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_id) lid: v
         !fast_neighbor_opaque(brick_idx, world_pos - vec3i(0, 0, 1), lx, ly, lz - 1);
 
     let albedo = textureLoad(t_palette, vec2i(i32(mat_id % 256u), i32(mat_id / 256u)), 0, 0).rgb;
-    let emission = textureLoad(t_palette, vec2i(i32(mat_id % 256u), i32(mat_id / 256u)), 1, 0).g;
+    let mat_props = textureLoad(t_palette, vec2i(i32(mat_id % 256u), i32(mat_id / 256u)), 1, 0);
+    let emission = mat_props.g;
 
     var radiance = albedo * emission * 5.0;
 
     if (is_surface) {
         let normal = estimate_normal_fast(brick_idx, world_pos, lx, ly, lz);
         let ndotl = max(dot(normal, -globals.sun_dir.xyz), 0.0);
-        // Sunlight is strictly applied in view-space.
+        let sun_contrib = globals.sun_color.rgb * globals.sun_dir.w * ndotl;
+        let sky_contrib = globals.sky_color.rgb * globals.sky_color.w;
+        radiance += albedo * (sun_contrib + sky_contrib);
     }
 
     radiance_pool[brick_idx * 512u + linear] = vec2u(pack2x16float(radiance.rg), pack2x16float(vec2f(radiance.b, 1.0)));

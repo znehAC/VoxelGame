@@ -2,8 +2,9 @@
 
 use ara_core::glam::IVec3;
 use ara_core::{
-    BRICK_EMPTY, BRICK_SIZE, BRICK_VOLUME, BrickHeader, MemoryBudget, PackedVoxel, TOP_GRID_SIZE,
-    TOP_GRID_VOLUME, WORLD_EXTENT, brick_local_index, bytemuck, world_to_brick, world_to_local,
+    BRICK_EMPTY, BRICK_SIZE, BRICK_VOLUME, BrickHeader, LOD_COUNT, MemoryBudget, PackedVoxel,
+    TOP_GRID_SIZE, TOP_GRID_VOLUME, WORLD_EXTENT, brick_local_index, bytemuck, world_to_brick,
+    world_to_local,
 };
 
 use crate::gpu::GpuContext;
@@ -17,12 +18,16 @@ pub struct BrickMap {
     radiance_pool_buf: wgpu::Buffer,
     free_list: Vec<u32>,
     world_origin: [i32; 3],
+    /// Per-LOD camera center in LOD-space brick coordinates.
+    lod_origins: [[i32; 3]; 8],
     max_bricks: u32,
     budget: MemoryBudget,
     /// CPU-side copy of the top grid for raycast lookups.
     top_grid: Vec<u32>,
     /// CPU-side sparse brick data for edited/loaded bricks.
     brick_data: Vec<Vec<PackedVoxel>>,
+    /// Bricks generated this frame whose GPU top-grid entry is deferred to next frame.
+    pending_reveals: Vec<(usize, u32)>,
 }
 
 impl BrickMap {
@@ -31,11 +36,11 @@ impl BrickMap {
         let max_bricks = budget.max_bricks();
         let device = gpu.device();
 
-        // Top grid: 64³ × 3 LODs × 4 bytes, initialized to BRICK_EMPTY
-        let top_grid_data = vec![BRICK_EMPTY; (TOP_GRID_VOLUME * 3) as usize];
+        // Top grid: 64³ × LOD_COUNT LODs × 4 bytes, initialized to BRICK_EMPTY
+        let top_grid_data = vec![BRICK_EMPTY; (TOP_GRID_VOLUME * LOD_COUNT) as usize];
         let top_grid_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ara Top Grid"),
-            size: (TOP_GRID_VOLUME * 3 * 4) as u64,
+            size: (TOP_GRID_VOLUME * LOD_COUNT * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -93,10 +98,12 @@ impl BrickMap {
             radiance_pool_buf,
             free_list,
             world_origin: [0, 0, 0],
+            lod_origins: [[0i32; 3]; 8],
             max_bricks,
             budget,
             top_grid: top_grid_data,
             brick_data,
+            pending_reveals: Vec::new(),
         }
     }
 
@@ -104,13 +111,8 @@ impl BrickMap {
     pub fn allocate_brick(&mut self, gpu: &GpuContext, brick_coord: [i32; 3]) -> Option<u32> {
         let brick_idx = self.free_list.pop()?;
 
-        // Write top grid entry
-        let gx = brick_coord[0] as u32 % TOP_GRID_SIZE;
-        let gy = brick_coord[1] as u32 % TOP_GRID_SIZE;
-        let gz = brick_coord[2] as u32 % TOP_GRID_SIZE;
-        let lod = 0u32;
-        let grid_idx =
-            (lod * TOP_GRID_VOLUME) + gz * TOP_GRID_SIZE * TOP_GRID_SIZE + gy * TOP_GRID_SIZE + gx;
+        // Write top grid entry (safe wrapping for negative coords)
+        let grid_idx = top_grid_index(0, brick_coord[0], brick_coord[1], brick_coord[2]) as u32;
 
         self.top_grid[grid_idx as usize] = brick_idx;
         gpu.queue().write_buffer(
@@ -137,6 +139,9 @@ impl BrickMap {
             bytemuck::bytes_of(&header),
         );
 
+        // Initialize CPU cache so get_voxel/write_voxel stay consistent
+        self.brick_data[brick_idx as usize] = vec![PackedVoxel::AIR; BRICK_VOLUME as usize];
+
         Some(brick_idx)
     }
 
@@ -149,11 +154,7 @@ impl BrickMap {
     ) -> Option<u32> {
         let brick_idx = self.free_list.pop()?;
 
-        let gx = brick_coord[0] as u32 % TOP_GRID_SIZE;
-        let gy = brick_coord[1] as u32 % TOP_GRID_SIZE;
-        let gz = brick_coord[2] as u32 % TOP_GRID_SIZE;
-        let grid_idx =
-            (lod * TOP_GRID_VOLUME) + gz * TOP_GRID_SIZE * TOP_GRID_SIZE + gy * TOP_GRID_SIZE + gx;
+        let grid_idx = top_grid_index(lod, brick_coord[0], brick_coord[1], brick_coord[2]) as u32;
 
         self.top_grid[grid_idx as usize] = brick_idx;
         gpu.queue().write_buffer(
@@ -183,57 +184,36 @@ impl BrickMap {
         Some(brick_idx)
     }
 
-    /// Generate LOD1 and LOD2 bricks for all occupied LOD0 regions.
+    /// Generate LOD1–(LOD_COUNT-1) bricks for all occupied lower-LOD regions.
     pub fn generate_lod_bricks(&mut self, gpu: &GpuContext) {
         let tgs = TOP_GRID_SIZE as i32;
 
-        // LOD0 → LOD1: group 2³ LOD0 bricks into LOD1 bricks
-        for bz in (0..tgs).step_by(2) {
-            for by in (0..tgs).step_by(2) {
-                for bx in (0..tgs).step_by(2) {
-                    let mut has_occupied = false;
-                    for dz in 0..2 {
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                let idx = top_grid_index(0, bx + dx, by + dy, bz + dz);
-                                if self.top_grid[idx] != BRICK_EMPTY {
-                                    has_occupied = true;
+        for dst_lod in 1..LOD_COUNT {
+            let src_lod = dst_lod - 1;
+            // At src_lod, the grid extent (in src_lod brick coords) is tgs >> src_lod
+            // but since the top_grid wraps toroidally we just iterate tgs >> src_lod unique coords.
+            let extent = tgs >> src_lod as i32;
+            for bz in (0..extent).step_by(2) {
+                for by in (0..extent).step_by(2) {
+                    for bx in (0..extent).step_by(2) {
+                        let mut has_occupied = false;
+                        'outer: for dz in 0..2i32 {
+                            for dy in 0..2i32 {
+                                for dx in 0..2i32 {
+                                    let idx = top_grid_index(src_lod, bx + dx, by + dy, bz + dz);
+                                    if self.top_grid[idx] != BRICK_EMPTY {
+                                        has_occupied = true;
+                                        break 'outer;
+                                    }
                                 }
                             }
                         }
-                    }
-                    if has_occupied {
-                        let lod1_coord = [bx / 2, by / 2, bz / 2];
-                        let idx = top_grid_index(1, lod1_coord[0], lod1_coord[1], lod1_coord[2]);
-                        if self.top_grid[idx] == BRICK_EMPTY {
-                            self.allocate_lod_brick(gpu, 1, lod1_coord);
-                        }
-                    }
-                }
-            }
-        }
-
-        // LOD1 → LOD2: group 2³ LOD1 bricks into LOD2 bricks
-        let lod1_extent = tgs / 2;
-        for bz in (0..lod1_extent).step_by(2) {
-            for by in (0..lod1_extent).step_by(2) {
-                for bx in (0..lod1_extent).step_by(2) {
-                    let mut has_occupied = false;
-                    for dz in 0..2 {
-                        for dy in 0..2 {
-                            for dx in 0..2 {
-                                let idx = top_grid_index(1, bx + dx, by + dy, bz + dz);
-                                if self.top_grid[idx] != BRICK_EMPTY {
-                                    has_occupied = true;
-                                }
+                        if has_occupied {
+                            let dst_coord = [bx / 2, by / 2, bz / 2];
+                            let idx = top_grid_index(dst_lod, dst_coord[0], dst_coord[1], dst_coord[2]);
+                            if self.top_grid[idx] == BRICK_EMPTY {
+                                self.allocate_lod_brick(gpu, dst_lod, dst_coord);
                             }
-                        }
-                    }
-                    if has_occupied {
-                        let lod2_coord = [bx / 2, by / 2, bz / 2];
-                        let idx = top_grid_index(2, lod2_coord[0], lod2_coord[1], lod2_coord[2]);
-                        if self.top_grid[idx] == BRICK_EMPTY {
-                            self.allocate_lod_brick(gpu, 2, lod2_coord);
                         }
                     }
                 }
@@ -411,12 +391,7 @@ impl BrickMap {
         }
 
         let bc = world_to_brick(pos.x, pos.y, pos.z);
-        let gx = bc[0] as u32 % TOP_GRID_SIZE;
-        let gy = bc[1] as u32 % TOP_GRID_SIZE;
-        let gz = bc[2] as u32 % TOP_GRID_SIZE;
-        let lod = 0usize;
-        let grid_idx = lod * TOP_GRID_VOLUME as usize
-            + (gz * TOP_GRID_SIZE * TOP_GRID_SIZE + gy * TOP_GRID_SIZE + gx) as usize;
+        let grid_idx = top_grid_index(0, bc[0], bc[1], bc[2]);
         let brick_idx = self.top_grid[grid_idx];
 
         if brick_idx == BRICK_EMPTY {
@@ -425,13 +400,7 @@ impl BrickMap {
 
         let lc = world_to_local(pos.x, pos.y, pos.z);
         let li = brick_local_index(lc[0], lc[1], lc[2]) as usize;
-
-        let data = &self.brick_data[brick_idx as usize];
-        if li < data.len() {
-            data[li]
-        } else {
-            PackedVoxel::AIR
-        }
+        self.brick_data[brick_idx as usize][li]
     }
 
     /// Write a single voxel to the GPU (and CPU cache) at the given world position.
@@ -447,12 +416,7 @@ impl BrickMap {
         }
 
         let bc = world_to_brick(world_pos.x, world_pos.y, world_pos.z);
-        let gx = bc[0] as u32 % TOP_GRID_SIZE;
-        let gy = bc[1] as u32 % TOP_GRID_SIZE;
-        let gz = bc[2] as u32 % TOP_GRID_SIZE;
-        let lod = 0usize;
-        let grid_idx = lod * TOP_GRID_VOLUME as usize
-            + (gz * TOP_GRID_SIZE * TOP_GRID_SIZE + gy * TOP_GRID_SIZE + gx) as usize;
+        let grid_idx = top_grid_index(0, bc[0], bc[1], bc[2]);
         let mut brick_idx = self.top_grid[grid_idx];
 
         // Allocate brick if needed
@@ -472,47 +436,113 @@ impl BrickMap {
         let lc = world_to_local(world_pos.x, world_pos.y, world_pos.z);
         let li = brick_local_index(lc[0], lc[1], lc[2]) as usize;
 
-        // Update CPU cache
-        if brick_idx < self.brick_data.len() as u32
-            && li < self.brick_data[brick_idx as usize].len()
-        {
-            self.brick_data[brick_idx as usize][li] = voxel;
-        }
+        // Update CPU cache (brick_data always initialized to BRICK_VOLUME on allocation)
+        self.brick_data[brick_idx as usize][li] = voxel;
 
         // Update GPU brick pool (u16 per voxel, must write aligned u32)
-        let word_idx = li / 2;
+        let pair_idx = li / 2;
         let data = &self.brick_data[brick_idx as usize];
-        let lo = if word_idx * 2 < data.len() {
-            data[word_idx * 2].packed as u32
-        } else {
-            0
-        };
-        let hi = if word_idx * 2 + 1 < data.len() {
-            data[word_idx * 2 + 1].packed as u32
-        } else {
-            0
-        };
+        let lo = data[pair_idx * 2].packed as u32;
+        let hi = data[pair_idx * 2 + 1].packed as u32;
         let word = lo | (hi << 16);
-        let offset = (brick_idx as u64 * BRICK_VOLUME as u64 * 2) + (word_idx as u64 * 4);
+        let offset = (brick_idx as u64 * BRICK_VOLUME as u64 * 2) + (pair_idx as u64 * 4);
         gpu.queue()
             .write_buffer(&self.brick_pool_buf, offset, bytemuck::bytes_of(&word));
 
         // Update occupancy bit
-        let word_idx = li / 32;
+        let occ_idx = li / 32;
         let occ_base = brick_idx as u64 * 16 * 4;
-
-        let data = &self.brick_data[brick_idx as usize];
         let mut occ_word = 0u32;
-        for i in (word_idx * 32)..((word_idx + 1) * 32).min(512) {
-            if i < data.len() && !data[i].is_air() {
+        for i in (occ_idx * 32)..((occ_idx + 1) * 32).min(512) {
+            if !data[i].is_air() {
                 occ_word |= 1 << (i % 32);
             }
         }
         gpu.queue().write_buffer(
             &self.brick_occupancy_buf,
-            occ_base + word_idx as u64 * 4,
+            occ_base + occ_idx as u64 * 4,
             bytemuck::bytes_of(&occ_word),
         );
+    }
+
+    /// Evict a brick at the given LOD and brick coordinate, returning it to the free list.
+    pub fn evict_brick(&mut self, gpu: &GpuContext, lod: u32, brick_coord: [i32; 3]) {
+        let grid_idx = top_grid_index(lod, brick_coord[0], brick_coord[1], brick_coord[2]);
+        let brick_idx = self.top_grid[grid_idx];
+        if brick_idx == BRICK_EMPTY {
+            return;
+        }
+        self.pending_reveals.retain(|&(gid, _)| gid != grid_idx);
+        self.top_grid[grid_idx] = BRICK_EMPTY;
+        self.free_list.push(brick_idx);
+        self.brick_data[brick_idx as usize] = Vec::new();
+
+        let sentinel = BRICK_EMPTY;
+        gpu.queue().write_buffer(
+            &self.top_grid_buf,
+            grid_idx as u64 * 4,
+            bytemuck::bytes_of(&sentinel),
+        );
+        let empty_header = [0xFFu8; 16];
+        gpu.queue().write_buffer(
+            &self.brick_header_buf,
+            brick_idx as u64 * 16,
+            &empty_header,
+        );
+    }
+
+    /// Allocate a brick slot and write the top grid and header.
+    /// Returns the brick pool index to use in a [`TerrainGenJob`].
+    /// Voxel data is written by the GPU terrain shader, not here.
+    /// The GPU top-grid entry is held back until the next call to [`reveal_pending`]
+    /// so the coarser LOD remains visible while terrain gen runs.
+    pub fn begin_brick_generation(
+        &mut self,
+        gpu: &GpuContext,
+        lod: u32,
+        brick_coord: [i32; 3],
+    ) -> Option<u32> {
+        let grid_idx = top_grid_index(lod, brick_coord[0], brick_coord[1], brick_coord[2]);
+        if self.top_grid[grid_idx] != BRICK_EMPTY {
+            return None;
+        }
+        let brick_idx = if lod == 0 {
+            self.allocate_brick(gpu, brick_coord)?
+        } else {
+            self.allocate_lod_brick(gpu, lod, brick_coord)?
+        };
+        // Overwrite the immediate GPU upload with BRICK_EMPTY; real idx committed next frame.
+        let sentinel = BRICK_EMPTY;
+        gpu.queue().write_buffer(
+            &self.top_grid_buf,
+            grid_idx as u64 * 4,
+            bytemuck::bytes_of(&sentinel),
+        );
+        self.pending_reveals.push((grid_idx, brick_idx));
+        Some(brick_idx)
+    }
+
+    /// Commit pending brick reveals to the GPU top-grid.
+    /// Call once per frame before terrain streaming to make last-frame bricks visible.
+    pub fn reveal_pending(&mut self, gpu: &GpuContext) {
+        for &(grid_idx, brick_idx) in &self.pending_reveals {
+            gpu.queue().write_buffer(
+                &self.top_grid_buf,
+                grid_idx as u64 * 4,
+                bytemuck::bytes_of(&brick_idx),
+            );
+        }
+        self.pending_reveals.clear();
+    }
+
+    /// Return per-LOD camera center in LOD-space brick coordinates.
+    pub fn lod_origin(&self, lod: u32) -> [i32; 3] {
+        self.lod_origins[lod as usize]
+    }
+
+    /// Set per-LOD camera center in LOD-space brick coordinates.
+    pub fn set_lod_origin(&mut self, lod: u32, origin: [i32; 3]) {
+        self.lod_origins[lod as usize] = origin;
     }
 
     /// Pool utilization as a fraction (0.0 to 1.0).
@@ -553,4 +583,92 @@ fn top_grid_index(lod: u32, bx: i32, by: i32, bz: i32) -> usize {
     let y = ((by % tgs + tgs) % tgs) as u32;
     let z = ((bz % tgs + tgs) % tgs) as u32;
     (lod * TOP_GRID_VOLUME + z * TOP_GRID_SIZE * TOP_GRID_SIZE + y * TOP_GRID_SIZE + x) as usize
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn top_grid_index_positive_coords() {
+        let idx = top_grid_index(0, 5, 10, 20);
+        let expected = (20 * 64 * 64 + 10 * 64 + 5) as usize;
+        assert_eq!(idx, expected);
+    }
+
+    #[test]
+    fn top_grid_index_wraps_negative() {
+        // -1 should wrap to 63 in a 64-sized grid
+        let idx_neg = top_grid_index(0, -1, 0, 0);
+        let idx_pos = top_grid_index(0, 63, 0, 0);
+        assert_eq!(idx_neg, idx_pos);
+    }
+
+    #[test]
+    fn top_grid_index_wraps_overflow() {
+        // 64 should wrap to 0
+        let idx_over = top_grid_index(0, 64, 0, 0);
+        let idx_zero = top_grid_index(0, 0, 0, 0);
+        assert_eq!(idx_over, idx_zero);
+    }
+
+    #[test]
+    fn top_grid_index_negative_all_axes() {
+        let idx = top_grid_index(0, -1, -2, -3);
+        let expected = top_grid_index(0, 63, 62, 61);
+        assert_eq!(idx, expected);
+    }
+
+    #[test]
+    fn top_grid_index_lod_offset() {
+        let idx_lod0 = top_grid_index(0, 0, 0, 0);
+        let idx_lod1 = top_grid_index(1, 0, 0, 0);
+        assert_eq!(idx_lod0, 0);
+        assert_eq!(idx_lod1, TOP_GRID_VOLUME as usize);
+    }
+
+    #[test]
+    fn top_grid_index_bounds() {
+        // All indices for LOD0 should be within [0, TOP_GRID_VOLUME)
+        for bz in -64..128 {
+            for by in -64..128 {
+                for bx in -64..128 {
+                    let idx = top_grid_index(0, bx, by, bz);
+                    assert!(idx < TOP_GRID_VOLUME as usize,
+                        "index {} out of bounds for coords ({}, {}, {})", idx, bx, by, bz);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn world_to_brick_and_local_roundtrip() {
+        for wx in [0, 7, 8, 15, 63, 511] {
+            for wy in [0, 1, 8, 100] {
+                for wz in [0, 7, 16, 511] {
+                    let bc = world_to_brick(wx, wy, wz);
+                    let lc = world_to_local(wx, wy, wz);
+
+                    // Reconstruct world from brick + local
+                    let rx = bc[0] * BRICK_SIZE as i32 + lc[0] as i32;
+                    let ry = bc[1] * BRICK_SIZE as i32 + lc[1] as i32;
+                    let rz = bc[2] * BRICK_SIZE as i32 + lc[2] as i32;
+                    assert_eq!((rx, ry, rz), (wx, wy, wz),
+                        "roundtrip failed for ({}, {}, {})", wx, wy, wz);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn brick_local_index_range() {
+        for lz in 0..8u32 {
+            for ly in 0..8u32 {
+                for lx in 0..8u32 {
+                    let idx = brick_local_index(lx, ly, lz);
+                    assert!(idx < BRICK_VOLUME, "local index {} >= BRICK_VOLUME", idx);
+                }
+            }
+        }
+    }
 }

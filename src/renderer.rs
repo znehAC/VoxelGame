@@ -54,8 +54,7 @@ pub struct Renderer {
     light_buf: wgpu::Buffer,
     palette_tex: wgpu::Texture,
     vct: VctPipeline,
-    pub light_propagator: LightPropagator,
-    radiance_pool_pong: wgpu::Buffer,
+    light_propagator: LightPropagator,
     max_bricks: u32,
     post_process: BloomPipeline,
     fxaa: FxaaPipeline,
@@ -124,21 +123,7 @@ impl Renderer {
         let fxaa = FxaaPipeline::new(gpu.device(), &config);
         let smaa = SmaaPipeline::new(gpu, width, height, format, SmaaPreset::Ultra);
 
-        let final_sdr_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
-            label: Some("Final SDR Texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let final_sdr_view = final_sdr_texture.create_view(&Default::default());
+        let (final_sdr_texture, final_sdr_view) = Self::create_sdr_texture(gpu.device(), width, height, format);
 
         let ui_system = UiSystem::new(gpu, format);
 
@@ -318,13 +303,6 @@ impl Renderer {
         });
 
         let max_bricks = brick_map.max_bricks();
-        let radiance_pool_size = max_bricks as u64 * 512 * 8;
-        let radiance_pool_pong = gpu.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Ara Radiance Pool Pong"),
-            size: radiance_pool_size,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
 
         let light_propagator = LightPropagator::new(
             gpu,
@@ -536,21 +514,7 @@ impl Renderer {
             TaaPreset::Medium,
         );
 
-        let velocity_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
-            label: Some("Velocity Texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        let velocity_view = velocity_texture.create_view(&Default::default());
+        let (velocity_texture, velocity_view) = Self::create_velocity_texture(gpu.device(), width, height);
 
         let pipeline = gpu
             .device()
@@ -600,7 +564,6 @@ impl Renderer {
             palette_tex,
             vct,
             light_propagator,
-            radiance_pool_pong,
             max_bricks,
             post_process,
             fxaa,
@@ -626,6 +589,44 @@ impl Renderer {
         }
     }
 
+    fn create_sdr_texture(device: &wgpu::Device, width: u32, height: u32, format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Final SDR Texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        (tex, view)
+    }
+
+    fn create_velocity_texture(device: &wgpu::Device, width: u32, height: u32) -> (wgpu::Texture, wgpu::TextureView) {
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Velocity Texture"),
+            size: wgpu::Extent3d {
+                width: width.max(1),
+                height: height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg16Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&Default::default());
+        (tex, view)
+    }
+
     pub fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) {
         if width == 0 || height == 0 {
             return;
@@ -640,21 +641,9 @@ impl Renderer {
         self.smaa.resize(gpu, width, height);
         self.taa.resize(gpu, width, height);
 
-        self.final_sdr_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
-            label: Some("Final SDR Texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: self.config.format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        self.final_sdr_view = self.final_sdr_texture.create_view(&Default::default());
+        let (sdr_tex, sdr_view) = Self::create_sdr_texture(gpu.device(), width, height, self.config.format);
+        self.final_sdr_texture = sdr_tex;
+        self.final_sdr_view = sdr_view;
 
         self.blit_bind_group = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Blit Bind Group"),
@@ -671,21 +660,9 @@ impl Renderer {
             ],
         });
 
-        self.velocity_texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
-            label: Some("Velocity Texture"),
-            size: wgpu::Extent3d {
-                width: width.max(1),
-                height: height.max(1),
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
-            view_formats: &[],
-        });
-        self.velocity_view = self.velocity_texture.create_view(&Default::default());
+        let (vel_tex, vel_view) = Self::create_velocity_texture(gpu.device(), width, height);
+        self.velocity_texture = vel_tex;
+        self.velocity_view = vel_view;
 
         self.ui_system.resize(gpu, width, height);
     }
@@ -725,6 +702,18 @@ impl Renderer {
 
     pub fn prev_view_proj(&self) -> [[f32; 4]; 4] {
         self.prev_view_proj
+    }
+
+    /// Mark light as dirty with a radius around a world position (block edit).
+    pub fn mark_light_dirty_radius(&mut self, gpu: &GpuContext, pos: ara_core::glam::IVec3, radius: i32) {
+        self.light_propagator.mark_dirty_radius(gpu, pos, radius);
+        self.vct.mark_dirty();
+    }
+
+    /// Mark both light systems as needing full recomputation (chunk load, time-of-day).
+    pub fn mark_light_dirty(&mut self) {
+        self.light_propagator.mark_dirty(crate::light_propagator::LightDirtyReason::ChunkLoaded);
+        self.vct.mark_dirty();
     }
 
     pub fn aa_mode(&self) -> AaMode {
@@ -777,9 +766,14 @@ impl Renderer {
                 label: Some("Ara Frame Encoder"),
             });
 
-        self.vct.inject(&mut encoder, self.max_bricks);
-        self.light_propagator.execute(&mut encoder, 32, gpu);
-        self.vct.mipmap(&mut encoder, self.max_bricks);
+        // Sun injection + light propagation run only when dirty.
+        if self.light_propagator.needs_update() {
+            self.vct.inject(&mut encoder, self.max_bricks);
+            self.light_propagator.execute_if_dirty(&mut encoder, gpu);
+            self.vct.mipmap(&mut encoder, self.max_bricks);
+        } else if self.vct.needs_update() {
+            self.vct.execute_if_dirty(&mut encoder, self.max_bricks);
+        }
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
