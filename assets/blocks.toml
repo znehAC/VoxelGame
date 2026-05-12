@@ -10,21 +10,21 @@ id = "ara:dirt"
 name = "Dirt"
 color = "#8B6914"
 roughness = 0.95
-noise = 0.3
+noise = 0.5
 
 [[block]]
 id = "ara:stone"
 name = "Stone"
 color = "#808080"
 roughness = 0.9
-noise = 0.7
+noise = 0.1
 
 [[block]]
 id = "ara:sand"
 name = "Sand"
 color = "#F4D03F"
 roughness = 0.7
-noise = 0.8
+noise = 0.55
 
 [[block]]
 id = "ara:water"

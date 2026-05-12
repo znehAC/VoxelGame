@@ -520,7 +520,8 @@ fn create_texture(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_DST
-            | wgpu::TextureUsages::COPY_SRC,
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::STORAGE_BINDING,
         view_formats: &[],
     })
 }
@@ -559,12 +560,8 @@ impl FxaaPipeline {
         });
 
         // Initial upload (will also be done in resize, but good to have)
-        // We can't upload here easily without a queue, but resize is usually called immediately after or logic handles it.
-        // Actually, we can use create_buffer_init if we had the util trait, but we don't.
-        // We will rely on resize() being called or queue write in resize.
-        // Since resize() requires queue, we will leave it empty here or require queue in new().
-        // Existing pipelines don't take queue in new(), but resize() is called in Renderer::new usually?
-        // Renderer::new calls pipeline.resize() usually.
+
+
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("FXAA Bind Group Layout"),

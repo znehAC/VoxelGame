@@ -12,10 +12,6 @@ pub struct TerrainGenJob {
     pub brick_x: i32,
     pub brick_y: i32,
     pub brick_z: i32,
-    pub lod: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
 }
 
 /// Compute pipeline that fills brick_pool + brick_occupancy from a sine-wave height function.

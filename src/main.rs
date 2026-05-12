@@ -4,12 +4,13 @@ mod assets;
 mod brick_map;
 mod camera;
 mod chunk_streamer;
+mod clipmap;
 mod gpu;
-mod light;
-mod light_propagator;
 mod postprocess;
+mod ray_pipeline;
 mod renderer;
 mod settings;
+
 mod terrain_pipeline;
 mod ui;
 
@@ -34,6 +35,7 @@ use camera::{FpsCamera, HaltonJitter};
 use chunk_streamer::ChunkStreamer;
 use gpu::GpuContext;
 use renderer::{AaMode, Renderer};
+
 use terrain_pipeline::TerrainPipeline;
 
 const WINDOW_TITLE: &str = "Turi";
@@ -67,6 +69,7 @@ struct App {
     fps_update_time: Instant,
     brick_map: Option<BrickMap>,
     streamer: Option<ChunkStreamer>,
+
     terrain_pipeline: Option<TerrainPipeline>,
     selected_material: u16,
     target_block_name: Option<String>,
@@ -98,6 +101,7 @@ impl App {
             fps_update_time: Instant::now(),
             brick_map: None,
             streamer: None,
+
             terrain_pipeline: None,
             selected_material: 1,
             target_block_name: None,
@@ -163,7 +167,7 @@ impl ApplicationHandler for App {
         let mut sbm = BrickMap::new(&gpu, MemoryBudget::High);
         let terrain = TerrainPipeline::new(&gpu, &sbm, 256);
         let mut streamer = ChunkStreamer::new(128);
-        let spawn_pos = glam::Vec3::new(256.0, 100.0, 256.0);
+        let spawn_pos = glam::Vec3::new(256.0, 220.0, 256.0);
         streamer.initial_load(spawn_pos, &mut sbm, &terrain, &gpu);
         self.registry = Some(registry);
 
@@ -179,6 +183,7 @@ impl ApplicationHandler for App {
             self.settings.bloom_intensity,
             self.settings.bloom_exposure,
             self.settings.vsync,
+            spawn_pos,
         );
 
         let aspect = size.width as f32 / size.height.max(1) as f32;
@@ -187,11 +192,14 @@ impl ApplicationHandler for App {
         let initial_view_proj = self.camera.view_proj().to_cols_array_2d();
         renderer.init_prev_view_proj(initial_view_proj);
 
+
+
         self.window = Some(window);
         self.gpu = Some(gpu);
         self.renderer = Some(renderer);
         self.brick_map = Some(sbm);
         self.streamer = Some(streamer);
+
         self.terrain_pipeline = Some(terrain);
         self.last_frame_time = Some(Instant::now());
         self.start_time = Instant::now();
@@ -287,13 +295,6 @@ impl ApplicationHandler for App {
                             match button {
                                 MouseButton::Left => {
                                     sbm.write_voxel(gpu, hit.grid_pos, PackedVoxel::AIR);
-                                    if let Some(renderer) = &mut self.renderer {
-                                        renderer.mark_light_dirty_radius(
-                                            gpu,
-                                            hit.grid_pos,
-                                            32,
-                                        );
-                                    }
                                 }
                                 MouseButton::Right => {
                                     let we = WORLD_EXTENT as i32;
@@ -309,9 +310,6 @@ impl ApplicationHandler for App {
                                         if neighbor != cam_cell {
                                             let voxel = PackedVoxel::new(self.selected_material);
                                             sbm.write_voxel(gpu, neighbor, voxel);
-                                            if let Some(renderer) = &mut self.renderer {
-                                                renderer.mark_light_dirty_radius(gpu, neighbor, 32);
-                                            }
                                         }
                                     }
                                 }
@@ -328,7 +326,7 @@ impl ApplicationHandler for App {
             WindowEvent::Resized(new_size) => {
                 if let Some(gpu) = &self.gpu {
                     if let Some(renderer) = &mut self.renderer {
-                        renderer.resize(gpu, new_size.width, new_size.height);
+                        renderer.resize(gpu, new_size.width, new_size.height, self.brick_map.as_ref().unwrap());
                     }
                 }
                 let aspect = new_size.width as f32 / new_size.height.max(1) as f32;
@@ -377,6 +375,7 @@ impl ApplicationHandler for App {
                         streamer.update(self.camera.position, sbm, terrain, &mut enc, gpu);
                         gpu.queue().submit(std::iter::once(enc.finish()));
                     }
+
                     let time = self.start_time.elapsed().as_secs_f32();
                     let _time = time; // used for future dynamic objects
 
@@ -404,7 +403,7 @@ impl ApplicationHandler for App {
                         .to_cols_array_2d();
 
                     let s = &self.settings;
-                    let wo = sbm.world_origin();
+                    let wo = sbm.lod0_origin();
                     let uniforms = GlobalUniforms::with_view_proj(
                         self.camera.view_inverse().to_cols_array_2d(),
                         proj_inverse_jittered,
@@ -444,6 +443,7 @@ impl ApplicationHandler for App {
 
                     match renderer.render(
                         gpu,
+                        self.camera.position,
                         &uniforms,
                         &lights,
                         &crate::ui::UiContext {
@@ -455,7 +455,7 @@ impl ApplicationHandler for App {
                         Ok(()) => {}
                         Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                             let size = window.inner_size();
-                            renderer.resize(gpu, size.width, size.height);
+                            renderer.resize(gpu, size.width, size.height, self.brick_map.as_ref().unwrap());
                         }
                         Err(wgpu::SurfaceError::OutOfMemory) => {
                             error!("Out of GPU memory");
@@ -486,7 +486,7 @@ impl ApplicationHandler for App {
                         _                   => "W",
                     };
                     let (lod0_orig, pool_pct) = self.brick_map.as_ref().map(|bm| {
-                        let o = bm.lod_origin(0);
+                        let o = bm.lod0_origin();
                         (format!("[{},{},{}]", o[0], o[1], o[2]), bm.utilization() * 100.0)
                     }).unwrap_or_default();
                     if let Some(window) = &self.window {

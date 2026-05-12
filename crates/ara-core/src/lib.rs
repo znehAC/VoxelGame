@@ -4,20 +4,26 @@
 //! No GPU dependencies.
 
 pub mod input;
+pub mod morton;
 pub mod raycast;
 pub mod registry;
+
 pub mod types;
+pub mod visibility;
 pub mod voxel;
 
 pub use bytemuck;
 pub use glam;
 
 pub use input::{Action, InputManager};
+pub use morton::{morton_decode, morton_encode};
 pub use raycast::{RayHit, dda_raycast};
 pub use registry::BlockRegistry;
+
 pub use types::{
     CameraPushConstants, GlobalUniforms, InputState, LightBuffer, PointLight, TaaUniforms,
 };
+pub use visibility::{NormalIndex, VisibilityPayload};
 pub use voxel::{BrickHeader, PackedVoxel};
 pub use voxel::{brick_local_index, world_to_brick, world_to_local};
 
@@ -26,6 +32,9 @@ pub type VoxelId = u16;
 
 /// Air voxel (empty space).
 pub const VOXEL_AIR: VoxelId = 0;
+
+/// Voxel scale in meters (5cm).
+pub const VOXEL_SCALE: f32 = 0.05;
 
 /// Side length of a single brick in voxels.
 pub const BRICK_SIZE: u32 = 8;
@@ -37,20 +46,20 @@ pub const BRICK_SHIFT: u32 = 3;
 pub const BRICK_VOLUME: u32 = 512;
 
 /// Side length of the top-level brick grid.
-pub const TOP_GRID_SIZE: u32 = 64;
+pub const TOP_GRID_SIZE: u32 = 128;
 
-/// Total entries in the top grid (64³).
-pub const LOD_COUNT: u32 = 8;
-pub const TOP_GRID_VOLUME: u32 = 262_144;
+/// Total entries in the top grid (128³ = 2,097,152).
+pub const TOP_GRID_VOLUME: u32 = 2_097_152;
 
-/// Total voxels per axis (TOP_GRID_SIZE * BRICK_SIZE = 512).
-pub const WORLD_EXTENT: u32 = 512;
+/// Total voxels per axis (TOP_GRID_SIZE * BRICK_SIZE = 1024).
+pub const WORLD_EXTENT: u32 = 1024;
 
 /// Sentinel value indicating an empty top-grid slot.
 pub const BRICK_EMPTY: u32 = 0xFFFFFFFF;
 
 /// Max raymarching steps for the outer (brick-level) DDA.
 pub const MAX_STEPS: u32 = 512;
+
 
 /// Pool-based memory budget derived from a total byte allocation.
 #[derive(Debug, Clone, Copy)]
@@ -65,20 +74,18 @@ impl PoolBudget {
         }
     }
 
-    /// Per-brick cost in bytes:
-    /// - Voxel pool: 512 × 2 = 1024
-    /// - Radiance pool: 512 × 8 = 4096
-    /// - Header: 16
-    /// - Occupancy: 64
-    /// Total: 5200 bytes/brick
-    const BYTES_PER_BRICK: u64 = 1024 + 4096 + 16 + 64;
+    /// Per-brick cost in bytes: voxel pool (1024) + header (16) + occupancy (64) = 1104
+    const BYTES_PER_BRICK: u64 = 1024 + 16 + 64;
 
-    /// Top grid overhead: 64³ × 3 LODs × 4 bytes = 3 MB
-    const TOP_GRID_OVERHEAD: u64 = TOP_GRID_VOLUME as u64 * LOD_COUNT as u64 * 4;
+    /// Top grid overhead: 128³ × 4 bytes = 8 MB
+    const TOP_GRID_OVERHEAD: u64 = TOP_GRID_VOLUME as u64 * 4;
 
     pub fn max_bricks(&self) -> u32 {
         let available = self.total_bytes.saturating_sub(Self::TOP_GRID_OVERHEAD);
-        (available / Self::BYTES_PER_BRICK) as u32
+        let from_budget = (available / Self::BYTES_PER_BRICK) as u32;
+        // Radiance pool (largest buffer) = max_bricks × 512 × 8 = max_bricks × 4096.
+        // wgpu max buffer size is 1 GB → cap at 262,144 bricks.
+        from_budget.min(262_144)
     }
 
     pub fn render_distance_voxels(&self) -> f32 {
@@ -113,7 +120,7 @@ impl MemoryBudget {
         match self {
             Self::Low => PoolBudget::new(256),
             Self::Medium => PoolBudget::new(512),
-            Self::High => PoolBudget::new(1024),
+            Self::High => PoolBudget::new(2048),
         }
     }
 }

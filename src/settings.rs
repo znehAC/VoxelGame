@@ -36,7 +36,7 @@ impl Default for RenderSettings {
             camera_sprint_multiplier: 3.0,
             camera_mouse_sensitivity: 0.002,
             camera_fov: std::f32::consts::FRAC_PI_4,
-            camera_start_position: [256.0, 100.0, 256.0],
+            camera_start_position: [256.0, 220.0, 256.0],
             camera_start_pitch: -0.3,
             vsync: false,
         }

@@ -128,15 +128,15 @@ pub struct BrickHeader {
 }
 
 impl BrickHeader {
-    /// Pack a world brick coordinate into 10+10+10+2 bits (2 MSBs = LOD level).
+    /// Pack a world brick coordinate into 9+9+9+3 bits (LOD in bits 27-29).
     pub fn pack_coord(x: u32, y: u32, z: u32, lod: u32) -> u32 {
-        (x & 0x3FF) | ((y & 0x3FF) << 10) | ((z & 0x3FF) << 20) | ((lod & 0x3) << 30)
+        (x & 0x1FF) | ((y & 0x1FF) << 9) | ((z & 0x1FF) << 18) | ((lod & 0x7) << 27)
     }
 
-    /// Unpack world brick coordinate from packed u32 (masks out LOD bits 30-31).
+    /// Unpack world brick coordinate from packed u32 (masks out LOD bits 27-29).
     pub fn unpack_coord(packed: u32) -> [u32; 3] {
-        let p = packed & 0x3FFFFFFF;
-        [p & 0x3FF, (p >> 10) & 0x3FF, (p >> 20) & 0x3FF]
+        let p = packed & 0x7FFFFFF;
+        [p & 0x1FF, (p >> 9) & 0x1FF, (p >> 18) & 0x1FF]
     }
 }
 
@@ -153,10 +153,13 @@ pub fn world_to_local(x: i32, y: i32, z: i32) -> [u32; 3] {
     [(x & mask) as u32, (y & mask) as u32, (z & mask) as u32]
 }
 
-/// Compute the linear index within a brick from local coordinates.
+/// Compute the Morton Z-order index within a brick from local coordinates.
+///
+/// Morton encoding interleaves bits of (x, y, z) for 3D cache locality.
+/// Each coordinate must be 0..7.
 #[inline]
 pub fn brick_local_index(lx: u32, ly: u32, lz: u32) -> u32 {
-    lz * crate::BRICK_SIZE * crate::BRICK_SIZE + ly * crate::BRICK_SIZE + lx
+    crate::morton::morton_encode(lx, ly, lz)
 }
 
 #[cfg(test)]

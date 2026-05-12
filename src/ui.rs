@@ -129,10 +129,8 @@ impl UiComponent for HotbarComponent {
         let x = (ctx.screen_width - w) / 2.0;
         let y = ctx.screen_height - h - 20.0;
 
-        // Background
         batch.push_rect(x, y, w, h, [0.1, 0.1, 0.1, 0.5]);
 
-        // Selection Box (just a placeholder visual)
         batch.push_rect(x + 10.0, y + 5.0, 40.0, 40.0, [1.0, 1.0, 1.0, 0.3]);
     }
 }
@@ -145,7 +143,6 @@ pub struct UiSystem {
     bind_group: wgpu::BindGroup,
     vertex_capacity: usize,
     index_capacity: usize,
-    // Store components
     components: Vec<Box<dyn UiComponent>>,
 }
 
@@ -168,7 +165,6 @@ impl UiSystem {
             mapped_at_creation: false,
         });
 
-        // Dummy texture for now (1x1 white) to satisfy binding
         let texture = gpu.device().create_texture(&wgpu::TextureDescriptor {
             label: Some("UI Dummy Texture"),
             size: wgpu::Extent3d {
@@ -328,7 +324,6 @@ impl UiSystem {
                 cache: None,
             });
 
-        // Initial buffers (dynamically resized later if needed, but for now fixed size is easier)
         let vertex_capacity = 1024;
         let index_capacity = 2048;
 
@@ -387,15 +382,12 @@ impl UiSystem {
             return;
         }
 
-        // Upload buffers (resize if needed, simplified for now: panic if too small or just clamp)
-        // In real engine: reallocate buffer.
         let v_bytes = bytemuck::cast_slice(&batch.vertices);
         let i_bytes = bytemuck::cast_slice(&batch.indices);
 
         if batch.vertices.len() > self.vertex_capacity || batch.indices.len() > self.index_capacity
         {
             log::warn!("UI batch overflow");
-            // For now, just truncate or return to avoid crash
         }
 
         gpu.queue().write_buffer(&self.vertex_buffer, 0, v_bytes);

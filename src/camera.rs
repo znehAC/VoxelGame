@@ -137,15 +137,12 @@ impl FpsCamera {
         }
     }
 
-    /// Create a perspective projection matrix for Vulkan.
+    /// Create a perspective projection matrix for wgpu (Y-up NDC, Z in [0,1]).
     fn build_projection(aspect_ratio: f32, fov_y: f32) -> Mat4 {
         let near = 0.1;
         let far = 1000.0;
-
-        let mut proj = Mat4::perspective_rh(fov_y, aspect_ratio, near, far);
-        // Flip Y for Vulkan's NDC (Y-down in clip space)
-        proj.y_axis.y *= -1.0;
-        proj
+        // wgpu normalizes the Vulkan Y-flip internally; use the standard rh projection.
+        Mat4::perspective_rh(fov_y, aspect_ratio, near, far)
     }
 
     /// Apply sub-pixel jitter to projection matrix.

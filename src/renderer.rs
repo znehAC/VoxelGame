@@ -3,14 +3,16 @@
 use ara_core::glam::Mat4;
 use ara_core::{GlobalUniforms, LightBuffer, bytemuck};
 
-use crate::assets;
+use ara_core::glam::Vec3;
+
 use crate::brick_map::BrickMap;
+use crate::clipmap::VoxelClipmaps;
 use crate::gpu::GpuContext;
-use crate::light::VctPipeline;
-use crate::light_propagator::LightPropagator;
 use crate::postprocess::{
     BloomPipeline, FxaaPipeline, SmaaPipeline, SmaaPreset, TaaPipeline, TaaPreset,
 };
+use crate::ray_pipeline::RayPipeline;
+
 use crate::ui::{UiContext, UiSystem};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,14 +50,11 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
-    pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
+    ray_pipeline: RayPipeline,
+
     uniform_buf: wgpu::Buffer,
     light_buf: wgpu::Buffer,
     palette_tex: wgpu::Texture,
-    vct: VctPipeline,
-    light_propagator: LightPropagator,
-    max_bricks: u32,
     post_process: BloomPipeline,
     fxaa: FxaaPipeline,
     smaa: SmaaPipeline,
@@ -74,6 +73,7 @@ pub struct Renderer {
     blit_sampler: wgpu::Sampler,
     blit_bind_group: wgpu::BindGroup,
 
+    clipmaps: VoxelClipmaps,
     velocity_texture: wgpu::Texture,
     velocity_view: wgpu::TextureView,
     prev_view_proj: [[f32; 4]; 4],
@@ -94,6 +94,7 @@ impl Renderer {
         bloom_intensity: f32,
         bloom_exposure: f32,
         vsync: bool,
+        cam_pos: Vec3,
     ) -> Self {
         let caps = surface.get_capabilities(gpu.adapter());
         let format = caps
@@ -275,19 +276,6 @@ impl Renderer {
             },
         );
 
-        let palette_view = palette_tex.create_view(&wgpu::TextureViewDescriptor {
-            label: Some("Ara Palette View"),
-            dimension: Some(wgpu::TextureViewDimension::D2Array),
-            ..Default::default()
-        });
-
-        let palette_sampler = gpu.device().create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("Ara Palette Sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
         let uniform_buf = gpu.device().create_buffer(&wgpu::BufferDescriptor {
             label: Some("Ara Global Uniforms"),
             size: std::mem::size_of::<GlobalUniforms>() as u64,
@@ -302,209 +290,28 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
-        let max_bricks = brick_map.max_bricks();
+        let (velocity_texture, velocity_view) = Self::create_velocity_texture(gpu.device(), width, height);
 
-        let light_propagator = LightPropagator::new(
+        let mut clipmaps = VoxelClipmaps::new(gpu);
+        {
+            let mut enc = gpu.device().create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Clipmap Init"),
+            });
+            clipmaps.build_full(gpu, &mut enc, cam_pos);
+            gpu.queue().submit(std::iter::once(enc.finish()));
+        }
+
+        let ray_pipeline = RayPipeline::new(
             gpu,
-            brick_map.top_grid_buf(),
-            brick_map.brick_pool_buf(),
-            &palette_view,
-            &uniform_buf,
-            &light_buf,
-        );
-
-        let bind_group_layout =
-            gpu.device()
-                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                    label: Some("Ara Bind Group Layout"),
-                    entries: &[
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 0,
-                            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                                view_dimension: wgpu::TextureViewDimension::D2Array,
-                                multisampled: false,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 3,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 4,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 5,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 6,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 7,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 8,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 9,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 10,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                        wgpu::BindGroupLayoutEntry {
-                            binding: 11,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
-                            ty: wgpu::BindingType::Buffer {
-                                ty: wgpu::BufferBindingType::Uniform,
-                                has_dynamic_offset: false,
-                                min_binding_size: None,
-                            },
-                            count: None,
-                        },
-                    ],
-                });
-
-        let bind_group = gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Ara Bind Group"),
-            layout: &bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: uniform_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&palette_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&palette_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: brick_map.top_grid_buf().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: brick_map.brick_pool_buf().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 6,
-                    resource: brick_map.brick_occupancy_buf().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 7,
-                    resource: light_buf.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 8,
-                    resource: brick_map.radiance_pool_buf().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 9,
-                    resource: brick_map.brick_header_buf().as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 10,
-                    resource: light_propagator.light_grid_a.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 11,
-                    resource: light_propagator.origin_buf.as_entire_binding(),
-                },
-            ],
-        });
-
-        let vct = VctPipeline::new(
-            gpu,
-            brick_map.top_grid_buf(),
-            brick_map.brick_pool_buf(),
-            brick_map.brick_header_buf(),
-            brick_map.radiance_pool_buf(),
-            brick_map.brick_occupancy_buf(),
+            width,
+            height,
+            brick_map,
+            &clipmaps,
             &uniform_buf,
             &palette_tex,
+            post_process.hdr_view(),
+            &velocity_view,
         );
-
-        let shader_src = assets::load_shader().expect("Failed to load voxel_raytracer.wgsl");
-
-        let shader = gpu
-            .device()
-            .create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("Ara Fullscreen Shader"),
-                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-            });
-
-        let pipeline_layout =
-            gpu.device()
-                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                    label: Some("Ara Pipeline Layout"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
-                });
 
         let taa = TaaPipeline::new(
             gpu,
@@ -514,57 +321,14 @@ impl Renderer {
             TaaPreset::Medium,
         );
 
-        let (velocity_texture, velocity_view) = Self::create_velocity_texture(gpu.device(), width, height);
-
-        let pipeline = gpu
-            .device()
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Ara Render Pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[
-                        Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rgba16Float,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                        Some(wgpu::ColorTargetState {
-                            format: wgpu::TextureFormat::Rg16Float,
-                            blend: None,
-                            write_mask: wgpu::ColorWrites::ALL,
-                        }),
-                    ],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
-
         Self {
             surface,
             config,
-            pipeline,
-            bind_group,
+            ray_pipeline,
+
             uniform_buf,
             light_buf,
             palette_tex,
-            vct,
-            light_propagator,
-            max_bricks,
             post_process,
             fxaa,
             smaa,
@@ -572,7 +336,7 @@ impl Renderer {
             final_sdr_texture,
             final_sdr_view,
             ui_system,
-            aa_mode: AaMode::TaaThenSmaa,
+            aa_mode: AaMode::None,
             bloom_threshold,
             bloom_intensity,
             bloom_exposure,
@@ -580,6 +344,7 @@ impl Renderer {
             blit_bind_group_layout,
             blit_sampler,
             blit_bind_group,
+            clipmaps,
             velocity_texture,
             velocity_view,
             prev_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
@@ -619,15 +384,22 @@ impl Renderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg16Float,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            // Rgba16Float: universally supported for both TEXTURE_BINDING and STORAGE_BINDING
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
         let view = tex.create_view(&Default::default());
         (tex, view)
     }
 
-    pub fn resize(&mut self, gpu: &GpuContext, width: u32, height: u32) {
+    pub fn resize(
+        &mut self,
+        gpu: &GpuContext,
+        width: u32,
+        height: u32,
+        brick_map: &crate::brick_map::BrickMap,
+    ) {
         if width == 0 || height == 0 {
             return;
         }
@@ -637,6 +409,21 @@ impl Renderer {
         self.height = height;
         self.surface.configure(gpu.device(), &self.config);
         self.post_process.resize(gpu, width, height);
+        let (vel_tex, vel_view) = Self::create_velocity_texture(gpu.device(), width, height);
+        self.velocity_texture = vel_tex;
+        self.velocity_view = vel_view;
+
+        self.ray_pipeline.resize(
+            gpu,
+            width,
+            height,
+            brick_map,
+            &self.clipmaps,
+            &self.uniform_buf,
+            &self.palette_tex,
+            self.post_process.hdr_view(),
+            &self.velocity_view,
+        );
         self.fxaa.resize(gpu.queue(), width, height);
         self.smaa.resize(gpu, width, height);
         self.taa.resize(gpu, width, height);
@@ -659,10 +446,6 @@ impl Renderer {
                 },
             ],
         });
-
-        let (vel_tex, vel_view) = Self::create_velocity_texture(gpu.device(), width, height);
-        self.velocity_texture = vel_tex;
-        self.velocity_view = vel_view;
 
         self.ui_system.resize(gpu, width, height);
     }
@@ -704,18 +487,6 @@ impl Renderer {
         self.prev_view_proj
     }
 
-    /// Mark light as dirty with a radius around a world position (block edit).
-    pub fn mark_light_dirty_radius(&mut self, gpu: &GpuContext, pos: ara_core::glam::IVec3, radius: i32) {
-        self.light_propagator.mark_dirty_radius(gpu, pos, radius);
-        self.vct.mark_dirty();
-    }
-
-    /// Mark both light systems as needing full recomputation (chunk load, time-of-day).
-    pub fn mark_light_dirty(&mut self) {
-        self.light_propagator.mark_dirty(crate::light_propagator::LightDirtyReason::ChunkLoaded);
-        self.vct.mark_dirty();
-    }
-
     pub fn aa_mode(&self) -> AaMode {
         self.aa_mode
     }
@@ -724,12 +495,7 @@ impl Renderer {
         self.aa_mode = mode;
     }
 
-    pub fn vsync(&self) -> bool {
-        matches!(
-            self.config.present_mode,
-            wgpu::PresentMode::AutoVsync | wgpu::PresentMode::Fifo
-        )
-    }
+
 
     pub fn set_vsync(&mut self, gpu: &GpuContext, vsync: bool) {
         let new_mode = if vsync {
@@ -746,6 +512,7 @@ impl Renderer {
     pub fn render(
         &mut self,
         gpu: &GpuContext,
+        cam_pos: Vec3,
         uniforms: &GlobalUniforms,
         lights: &LightBuffer,
         ui_ctx: &UiContext,
@@ -766,44 +533,9 @@ impl Renderer {
                 label: Some("Ara Frame Encoder"),
             });
 
-        // Sun injection + light propagation run only when dirty.
-        if self.light_propagator.needs_update() {
-            self.vct.inject(&mut encoder, self.max_bricks);
-            self.light_propagator.execute_if_dirty(&mut encoder, gpu);
-            self.vct.mipmap(&mut encoder, self.max_bricks);
-        } else if self.vct.needs_update() {
-            self.vct.execute_if_dirty(&mut encoder, self.max_bricks);
-        }
-
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Ara Raytrace Pass"),
-                color_attachments: &[
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: self.post_process.hdr_view(),
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &self.velocity_view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
-                ],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &self.bind_group, &[]);
-            pass.draw(0..3, 0..1);
-        }
+        // Update clipmap cascades for current camera position, then ray march.
+        self.clipmaps.update(gpu, &mut encoder, cam_pos);
+        self.ray_pipeline.dispatch(&mut encoder);
 
         let (bt, bi, be) = (
             self.bloom_threshold,
